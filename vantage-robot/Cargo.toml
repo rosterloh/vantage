@@ -1,0 +1,16 @@
+[package]
+name = "vantage-robot"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vantage-protocol = { path = "../vantage-protocol" }
+vantage-signalling = { path = "../vantage-signalling" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sysinfo = "0.33"
