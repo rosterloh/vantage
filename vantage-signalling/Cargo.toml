@@ -14,6 +14,6 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-gstreamer = "0.23"
-gstreamer-webrtc = "0.23"
-gstreamer-sdp = "0.23"
+gstreamer = { version = "0.23", features = ["v1_22"] }
+gstreamer-webrtc = { version = "0.23", features = ["v1_22"] }
+gstreamer-sdp = { version = "0.23", features = ["v1_22"] }
