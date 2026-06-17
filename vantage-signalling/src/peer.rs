@@ -38,14 +38,18 @@ impl Peer {
 
         for s in ice_servers {
             for url in &s.urls {
-                if url.starts_with("stun:") {
+                if url.starts_with("stun:") && !url.starts_with("stun://") {
+                    // webrtcbin/libnice require the stun://host:port form, not stun:host:port.
+                    let normalized = format!("stun://{}", url.trim_start_matches("stun:"));
+                    webrtcbin.set_property("stun-server", &normalized);
+                } else if url.starts_with("stun://") {
                     webrtcbin.set_property("stun-server", url);
                 } else if url.starts_with("turn:") {
+                    // webrtcbin/libnice require the turn://[user:pass@]host:port form.
+                    let host = url.trim_start_matches("turn://").trim_start_matches("turn:");
                     let with_creds = match (&s.username, &s.credential) {
-                        (Some(u), Some(p)) => {
-                            format!("turn://{u}:{p}@{}", url.trim_start_matches("turn:"))
-                        }
-                        _ => url.clone(),
+                        (Some(u), Some(p)) => format!("turn://{u}:{p}@{host}"),
+                        _ => format!("turn://{host}"),
                     };
                     let _ = webrtcbin.emit_by_name::<bool>("add-turn-server", &[&with_creds]);
                 }
