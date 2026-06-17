@@ -1,3 +1,5 @@
+mod registry;
+
 fn main() {
-    println!("vantage placeholder");
+    println!("vantage-coordinator placeholder");
 }
