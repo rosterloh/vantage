@@ -7,7 +7,7 @@ use anyhow::Result;
 use vantage_protocol::codec;
 use vantage_protocol::signalling::{IceServer, RobotInfo, RobotMsg, ServerMsg};
 use vantage_protocol::{RobotId, SessionId};
-use vantage_signalling::peer::{Peer, PeerEvent};
+use vantage_signalling::peer::{Peer, PeerEvent, Role};
 use vantage_signalling::ws::CoordinatorWs;
 
 use telemetry::Sampler;
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
                     None => { tracing::info!("coordinator closed"); break; }
                     Some(ServerMsg::ClientConnected { session: s }) => {
                         tracing::info!("client connected: {s}");
-                        let p = Arc::new(Peer::new(&ice, true)?); // offerer creates data channel + offer
+                        let p = Arc::new(Peer::new(&ice, Role::Robot)?); // offerer creates data channel + offer
                         peer = Some(p);
                         session = Some(s);
                         dc_open = false;
