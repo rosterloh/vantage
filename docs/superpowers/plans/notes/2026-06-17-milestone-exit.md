@@ -47,13 +47,34 @@ no server-reflexive candidates, i.e. the NAT-traversal tier was broken. Fixed in
 `vantage-signalling/src/peer.rs` to normalize `stun:`→`stun://` and `turn:`→`turn://`
 (commit `4e539d2`). Re-ran: STUN error gone, telemetry still flows.
 
-## Not yet verified in this environment
+## TURN relay path — verified (2026-06-18)
 
-- **TURN relay path** (plan Task 12 step 3): requires a TURN server. `coturn` is not
-  installed here. The STUN/TURN URL normalization is fixed and unit-safe, but the
-  forced-relay end-to-end run is still pending a TURN server.
-  To run it: install `coturn`, start it with static creds, launch the coordinator with
-  `VANTAGE_TURN_URL/USER/PASS`, and force relay (e.g. `ice-transport-policy=relay`
-  gated behind an env flag, or firewall-drop host/srflx candidates).
-- **srflx candidate over public STUN**: not explicitly captured (loopback run doesn't
-  need it); worth confirming on a real NAT once relay infra is up.
+Ran forced-relay end-to-end against the **metered.ca** free tier (static
+username/password supplied via `.env`, served over `/ice`). Both peers launched with
+`VANTAGE_FORCE_RELAY=1`, which sets `webrtcbin`'s `ice-transport-policy=relay` so host
+and server-reflexive candidates are excluded. Observed:
+
+```
+robot:  registered as robot-1
+robot:  VANTAGE_FORCE_RELAY set — ICE restricted to relay candidates
+robot:  client connected: sess-18ba1855bde322b7
+robot:  data channel open
+client: connecting to Atlas (robot-1)
+client: VANTAGE_FORCE_RELAY set — ICE restricted to relay candidates
+client: data channel open
+client: telemetry: cpu=6.1% mem=15942/31798MB temps=26 uptime=2822192s
+```
+
+No TURN/ICE auth errors (a bad credential would fail the allocation with 401).
+Because relay-only policy excludes every direct candidate, an established data
+channel is conclusive proof media traversed the metered TURN relay — and that the
+metered credentials are valid. This closes plan Task 12 step 3.
+
+The relay toggle is `VANTAGE_FORCE_RELAY` (read in `vantage-signalling/src/peer.rs`).
+
+## Still worth doing later (non-blocking)
+
+- **srflx candidate over public STUN on a real NAT** (the middle ICE tier): not
+  explicitly captured; the loopback/relay runs don't exercise it.
+- **TURN-over-TLS (`turns:`)** support in the URL normalizer, for restrictive
+  firewalls. Currently only `stun:`/`turn:` are handled.

@@ -36,6 +36,16 @@ impl Peer {
             .build()
             .context("webrtcbin missing — install gst-plugins-bad")?;
 
+        // Test/diagnostic toggle: force ICE onto the TURN relay so the relay path can
+        // be validated on a single host (where host candidates would otherwise win).
+        if std::env::var("VANTAGE_FORCE_RELAY").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            webrtcbin.set_property(
+                "ice-transport-policy",
+                gst_webrtc::WebRTCICETransportPolicy::Relay,
+            );
+            tracing::warn!("VANTAGE_FORCE_RELAY set — ICE restricted to relay candidates");
+        }
+
         for s in ice_servers {
             for url in &s.urls {
                 if url.starts_with("stun:") && !url.starts_with("stun://") {
