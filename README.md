@@ -58,8 +58,13 @@ gst-inspect-1.0 webrtcbin                       # should print element details
 
 The coordinator hands ICE servers to peers. A public STUN server is used by
 default. For the relay path (when no direct connection is possible) a TURN server
-is required — for the PoC, a local `coturn` or the metered.ca free tier with static
-credentials. See the implementation plan for the relay test setup.
+is required — for the PoC, the metered.ca free tier or a self-hosted `coturn`, both
+with static credentials. The coordinator reads `VANTAGE_TURN_URL`,
+`VANTAGE_TURN_USER`, and `VANTAGE_TURN_PASS` (see the table below) and serves them
+over `/ice`.
+
+See **[docs/turn-setup.md](docs/turn-setup.md)** for full metered.ca and coturn-on-a-VPS
+setup, and the foundation plan for the forced-relay test.
 
 ## Build & test
 
