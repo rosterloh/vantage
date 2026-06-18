@@ -2,7 +2,7 @@ use anyhow::Result;
 use vantage_protocol::codec;
 use vantage_protocol::signalling::{ClientMsg, IceServer, ServerMsg};
 use vantage_protocol::telemetry::DeviceInfo;
-use vantage_signalling::peer::{Peer, PeerEvent};
+use vantage_signalling::peer::{Peer, PeerEvent, Role};
 use vantage_signalling::ws::CoordinatorWs;
 
 #[tokio::main]
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
 
     // 3. Build the answerer peer
     let ice = fetch_ice(&coord).await?;
-    let peer = Peer::new(&ice, false)?;
+    let peer = Peer::new(&ice, Role::Client)?;
 
     // 4. Split and run the signalling/data loop
     let (mut tx, mut rx) = ws.split();
