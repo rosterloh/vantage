@@ -8,6 +8,10 @@ use routes::{router, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env (TURN creds, bind addr, RUST_LOG) before reading any env var. Missing
+    // file is fine — real environment still wins for anything not set here.
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

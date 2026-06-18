@@ -34,8 +34,21 @@ A peer fetches `/ice`, and `vantage-signalling` normalizes each entry into the f
    not `turns:` (TURN-over-TLS). Use a non-TLS `turn:` URL for now. Adding `turns:`
    is a small follow-up in `vantage-signalling/src/peer.rs` if a TLS relay is needed
    to punch through restrictive corporate firewalls.
-3. **Static credentials only.** Ephemeral/time-limited credentials (metered's API,
-   or coturn's `use-auth-secret`) are deferred per the spec.
+3. **Static credentials only.** Ephemeral/time-limited credentials (metered's
+   HMAC/REST API, or coturn's `use-auth-secret`) are deferred per the spec.
+4. **Credentials are passed as a `turn://user:pass@host` URI.** If a password
+   contains `@`, `:`, or `/`, that URI breaks. Metered's *static* dashboard
+   credentials are alphanumeric and fine; metered's *HMAC/API* credentials are
+   base64 (can contain `/ + =`) and would need percent-encoding or a non-URI API —
+   another reason the static-credential path is the simple one for the PoC.
+
+### The coordinator loads `.env`
+`vantage-coordinator` calls `dotenvy::dotenv()` at startup, so a `.env` in the
+working directory is picked up automatically (the real process environment still
+overrides it). See `.env.example` for the keys. `.env` is gitignored — never commit
+real credentials. The robot and client read `VANTAGE_COORDINATOR` from the process
+environment (export it or prefix the command); they don't need the TURN vars (they
+fetch ICE config from the coordinator's `/ice`).
 
 `vantage-protocol::IceServer` already models multiple `urls` and the `/ice` payload
 is a JSON array, so lifting limitation 1 (and adding more STUN/TURN entries) is a
@@ -43,31 +56,42 @@ coordinator-only change when you want it.
 
 ---
 
-## Option A — metered.ca (free tier, quickest)
+## Option A — metered.ca (free 20 GB/month tier)
 
-1. Sign up at <https://www.metered.ca/stun-turn> and open the dashboard.
-2. Under your TURN app you'll find static credentials and a list of ICE server URLs,
-   for example:
+Metered gives you credentials two ways. **Use the static pair** — it works with the
+current code and needs no API key:
+
+- **Static username/password (use this).** Your metered app dashboard shows a fixed
+  `username` + `credential` plus a list of ICE server URLs. These plug straight into
+  the `VANTAGE_TURN_*` vars.
+- **API key + REST endpoint (alternative, not implemented).** Metered also exposes
+  `https://<yourapp>.metered.live/api/v1/turn/credentials?apiKey=<API_KEY>`, which
+  returns an `iceServers` array of (often rotating) credentials. The right way to use
+  this is to give the **coordinator** the API key and have it fetch + serve those over
+  `/ice` (keeps the key server-side). That's a small future enhancement; you do **not**
+  need it if you have the static pair.
+
+### Setup with static credentials
+
+1. From the dashboard, copy your `username`, `credential`, and pick **one plain
+   `turn:` URL** (e.g. `turn:standard.relay.metered.ca:443`). Do **not** use the
+   `turns:...` (TLS) URL — see limitation 2. Example URLs metered lists:
    - `stun:stun.relay.metered.ca:80`
    - `turn:standard.relay.metered.ca:80`
    - `turn:standard.relay.metered.ca:443`
-   - `turns:standard.relay.metered.ca:443?transport=tcp`  ← do **not** use (TLS, see limitation 2)
-   plus a **username** and **credential** (password).
-3. Give Vantage one plain `turn:` URL and the creds:
-
+   - `turns:standard.relay.metered.ca:443?transport=tcp`  ← do **not** use (TLS)
+2. Put them in `.env` at the repo root (gitignored; see `.env.example`):
    ```bash
-   export VANTAGE_TURN_URL=turn:standard.relay.metered.ca:443
-   export VANTAGE_TURN_USER=<username-from-dashboard>
-   export VANTAGE_TURN_PASS=<credential-from-dashboard>
+   VANTAGE_TURN_URL=turn:standard.relay.metered.ca:443
+   VANTAGE_TURN_USER=<username-from-dashboard>
+   VANTAGE_TURN_PASS=<credential-from-dashboard>
+   ```
+3. Run the coordinator (it loads `.env` automatically):
+   ```bash
    RUST_LOG=info cargo run -p vantage-coordinator
    ```
-
    `curl -s localhost:8080/ice` should now show both the STUN entry and your TURN
    entry (with `username`/`credential`).
-
-> Metered also offers a REST endpoint that returns **ephemeral** credentials. That's
-> the right long-term answer (short-lived creds, no shared secret in env) but is
-> out of scope for the PoC, which uses the static dashboard credentials above.
 
 ---
 

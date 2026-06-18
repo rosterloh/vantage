@@ -1,2 +1,7 @@
 /target
 .claude/
+
+# Secrets — never commit real credentials (TURN creds, etc.)
+.env
+.env.*
+!.env.example
