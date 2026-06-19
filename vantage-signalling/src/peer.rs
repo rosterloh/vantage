@@ -300,6 +300,10 @@ fn add_video_source(
     let srcconvert = gst::ElementFactory::make("videoconvert").build()?;
     let srccaps = gst::ElementFactory::make("capsfilter")
         .property("caps", &gst::Caps::builder("video/x-raw")
+            // Force I420 (4:2:0): cameras often negotiate YUYV (4:2:2), which x264enc
+            // baseline rejects ("baseline profile doesn't support 4:2:2"). I420 also
+            // converts cleanly to RGB on the raw branch.
+            .field("format", "I420")
             .field("width", 640i32).field("height", 480i32)
             .field("framerate", gst::Fraction::new(30, 1))
             .build())
