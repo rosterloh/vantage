@@ -37,6 +37,15 @@ pub struct VideoFrame {
     pub rgba: Vec<u8>, // tightly packed, width*height*4 bytes
 }
 
+/// One raw camera frame from the pre-encode tee branch (RGB888). Consumed by the
+/// ROS2 bridge in Phase 4b; logged for concurrency verification in Phase 4a.
+pub struct RawFrame {
+    pub width: u32,
+    pub height: u32,
+    pub encoding: String, // "rgb8"
+    pub data: Vec<u8>,    // tightly packed, width*height*3 bytes
+}
+
 pub struct Peer {
     pub pipeline: gst::Pipeline,
     pub webrtcbin: gst::Element,
@@ -45,6 +54,8 @@ pub struct Peer {
     data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
     frames_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<VideoFrame>>,
     frames_tx: mpsc::UnboundedSender<VideoFrame>,
+    raw_frames_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RawFrame>>,
+    raw_frames_tx: mpsc::UnboundedSender<RawFrame>,
 }
 
 impl Peer {
@@ -106,6 +117,7 @@ impl Peer {
         }
 
         let (frames_tx, frames_rx) = mpsc::unbounded_channel::<VideoFrame>();
+        let (raw_frames_tx, raw_frames_rx) = mpsc::unbounded_channel::<RawFrame>();
 
         let peer = Self {
             pipeline,
@@ -115,6 +127,8 @@ impl Peer {
             data_channel: std::sync::Mutex::new(None),
             frames_rx: tokio::sync::Mutex::new(frames_rx),
             frames_tx: frames_tx.clone(),
+            raw_frames_rx: tokio::sync::Mutex::new(raw_frames_rx),
+            raw_frames_tx: raw_frames_tx.clone(),
         };
 
         // The SCTP transport (and thus create-data-channel) is only available once the
@@ -134,7 +148,7 @@ impl Peer {
                 wire_data_channel(&dc, &tx);
                 *peer.data_channel.lock().unwrap() = Some(dc);
 
-                add_video_test_source(&peer.pipeline, &peer.webrtcbin)?;
+                add_video_source(&peer.pipeline, &peer.webrtcbin, &peer.raw_frames_tx)?;
                 wire_on_negotiation_needed(&peer.webrtcbin, &tx);
             }
             Role::Client => {
@@ -159,6 +173,11 @@ impl Peer {
     /// Await the next decoded video frame (RGBA). Returns None when the pipeline ends.
     pub async fn recv_frame(&self) -> Option<VideoFrame> {
         self.frames_rx.lock().await.recv().await
+    }
+
+    /// Await the next raw camera frame (RGB888) from the pre-encode tee branch.
+    pub async fn recv_raw_frame(&self) -> Option<RawFrame> {
+        self.raw_frames_rx.lock().await.recv().await
     }
 
     /// Apply a Signal received from the remote peer (offer/answer/ice).
@@ -269,68 +288,138 @@ fn wire_on_negotiation_needed(webrtcbin: &gst::Element, tx: &mpsc::UnboundedSend
     });
 }
 
-/// videotestsrc -> x264enc(H.264) -> rtph264pay -> webrtcbin, send-only.
-fn add_video_test_source(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Result<()> {
-    let src = gst::ElementFactory::make("videotestsrc")
-        .property_from_str("pattern", "smpte")
-        .property("is-live", true)
+/// Build the robot send graph: source → tee, with an H.264 encode branch into
+/// webrtcbin (send-only) and a raw RGB branch into an appsink emitting RawFrames.
+fn add_video_source(
+    pipeline: &gst::Pipeline,
+    webrtcbin: &gst::Element,
+    raw_tx: &mpsc::UnboundedSender<RawFrame>,
+) -> Result<()> {
+    // --- source → videoconvert → caps(640x480@30) → tee ---
+    let source = build_source()?;
+    let srcconvert = gst::ElementFactory::make("videoconvert").build()?;
+    let srccaps = gst::ElementFactory::make("capsfilter")
+        .property("caps", &gst::Caps::builder("video/x-raw")
+            .field("width", 640i32).field("height", 480i32)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .build())
         .build()?;
-    let caps = gst::ElementFactory::make("capsfilter")
-        .property(
-            "caps",
-            &gst::Caps::builder("video/x-raw")
-                .field("width", 640i32)
-                .field("height", 480i32)
-                .field("framerate", gst::Fraction::new(30, 1))
-                .build(),
-        )
+    let tee = gst::ElementFactory::make("tee").name("t").build()?;
+
+    pipeline.add_many([&source, &srcconvert, &srccaps, &tee])?;
+    gst::Element::link_many([&source, &srcconvert, &srccaps, &tee])?;
+
+    // --- encode branch: tee → queue(leaky) → encoder → h264parse → rtph264pay → webrtcbin ---
+    let equeue = gst::ElementFactory::make("queue")
+        .property_from_str("leaky", "downstream")
         .build()?;
-    let convert = gst::ElementFactory::make("videoconvert").build()?;
-    let enc = gst::ElementFactory::make("x264enc")
-        .property_from_str("tune", "zerolatency")
-        .property_from_str("speed-preset", "ultrafast")
-        .property("bitrate", 1500u32)
-        .property("key-int-max", 30u32)
-        .build()?;
+    let enc = crate::encoder::make_h264_encoder()?;
+    let parse = gst::ElementFactory::make("h264parse").build()?;
     let pay = gst::ElementFactory::make("rtph264pay")
         .property("config-interval", -1i32)
         .property("pt", 96u32)
         .build()?;
     let rtpcaps = gst::ElementFactory::make("capsfilter")
-        .property(
-            "caps",
-            &gst::Caps::builder("application/x-rtp")
-                .field("media", "video")
-                .field("encoding-name", "H264")
-                .field("payload", 96i32)
-                .build(),
-        )
+        .property("caps", &gst::Caps::builder("application/x-rtp")
+            .field("media", "video").field("encoding-name", "H264").field("payload", 96i32)
+            .build())
         .build()?;
 
-    pipeline.add_many([&src, &caps, &convert, &enc, &pay, &rtpcaps])?;
-    gst::Element::link_many([&src, &caps, &convert, &enc, &pay, &rtpcaps])?;
+    pipeline.add_many([&equeue, &enc, &parse, &pay, &rtpcaps])?;
+    gst::Element::link_many([&equeue, &enc, &parse, &pay, &rtpcaps])?;
+    link_tee(&tee, &equeue)?;
 
     let src_pad = rtpcaps.static_pad("src").context("rtpcaps has no src pad")?;
-    let sink_pad = webrtcbin
-        .request_pad_simple("sink_%u")
+    let sink_pad = webrtcbin.request_pad_simple("sink_%u")
         .context("webrtcbin refused a sink pad")?;
     src_pad.link(&sink_pad)?;
 
-    // The pipeline is already PLAYING when this runs; bring the new elements up to speed.
-    for el in [&src, &caps, &convert, &enc, &pay, &rtpcaps] {
-        el.sync_state_with_parent()?;
-    }
-
-    // Make the transceiver send-only. Best-effort: if it can't be retrieved, sendrecv
-    // still yields one-way flow (client answers recvonly).
     let transceiver = webrtcbin
         .emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
-    transceiver.set_property(
-        "direction",
-        gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
-    );
+    transceiver.set_property("direction", gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly);
 
+    // --- raw branch: tee → queue → videoconvert → RGB appsink → RawFrame ---
+    let rqueue = gst::ElementFactory::make("queue").build()?;
+    let rconvert = gst::ElementFactory::make("videoconvert").build()?;
+    let rawsink = gst_app::AppSink::builder()
+        .caps(&gst::Caps::builder("video/x-raw").field("format", "RGB").build())
+        .max_buffers(2)
+        .drop(true)
+        .build();
+    {
+        let raw_tx = raw_tx.clone();
+        rawsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                    let info = gst_video::VideoInfo::from_caps(caps)
+                        .map_err(|_| gst::FlowError::Error)?;
+                    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                        .map_err(|_| gst::FlowError::Error)?;
+                    let width = info.width() as usize;
+                    let height = info.height() as usize;
+                    let stride = frame.plane_stride()[0] as usize;
+                    let src = frame.plane_data(0).map_err(|_| gst::FlowError::Error)?;
+                    let mut data = Vec::with_capacity(width * height * 3);
+                    for row in 0..height {
+                        let start = row * stride;
+                        data.extend_from_slice(&src[start..start + width * 3]);
+                    }
+                    let _ = raw_tx.send(RawFrame {
+                        width: width as u32,
+                        height: height as u32,
+                        encoding: "rgb8".into(),
+                        data,
+                    });
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
+    let rawsink_el: gst::Element = rawsink.upcast();
+    pipeline.add_many([&rqueue, &rconvert, &rawsink_el])?;
+    gst::Element::link_many([&rqueue, &rconvert, &rawsink_el])?;
+    link_tee(&tee, &rqueue)?;
+
+    // Elements added to an already-PLAYING pipeline must sync their state.
+    for e in [
+        &source, &srcconvert, &srccaps, &tee, &equeue, &enc, &parse, &pay, &rtpcaps,
+        &rqueue, &rconvert, &rawsink_el,
+    ] {
+        e.sync_state_with_parent()?;
+    }
     Ok(())
+}
+
+/// Request a `src_%u` pad off the tee and link it to a downstream element's sink.
+fn link_tee(tee: &gst::Element, downstream: &gst::Element) -> Result<()> {
+    let tee_src = tee.request_pad_simple("src_%u").context("tee has no src pad")?;
+    let sink = downstream.static_pad("sink").context("downstream has no sink pad")?;
+    tee_src.link(&sink)?;
+    Ok(())
+}
+
+/// `VANTAGE_VIDEO_SOURCE=camera` → v4l2src (`VANTAGE_CAMERA_DEVICE`, default /dev/video0);
+/// anything else (default) → videotestsrc SMPTE pattern.
+fn build_source() -> Result<gst::Element> {
+    let kind = std::env::var("VANTAGE_VIDEO_SOURCE").unwrap_or_else(|_| "test".into());
+    if kind == "camera" {
+        let dev = std::env::var("VANTAGE_CAMERA_DEVICE").unwrap_or_else(|_| "/dev/video0".into());
+        tracing::info!("video source: camera {dev}");
+        gst::ElementFactory::make("v4l2src")
+            .property("device", dev.as_str())
+            .build()
+            .context("v4l2src — camera source")
+    } else {
+        tracing::info!("video source: test pattern");
+        gst::ElementFactory::make("videotestsrc")
+            .property_from_str("pattern", "smpte")
+            .property("is-live", true)
+            .build()
+            .context("videotestsrc")
+    }
 }
 
 /// On the answerer, decode the incoming H.264 track to RGBA frames.
