@@ -53,6 +53,23 @@ async fn main() -> Result<()> {
                     Some(ServerMsg::ClientConnected { session: s }) => {
                         tracing::info!("client connected: {s}");
                         let p = Arc::new(Peer::new(&ice, Role::Robot)?); // offerer creates data channel + offer
+                        // Drain the raw (pre-encode) branch so its channel doesn't grow,
+                        // and log counts to prove it runs alongside the WebRTC stream.
+                        {
+                            let p_raw = p.clone();
+                            tokio::spawn(async move {
+                                let mut n: u64 = 0;
+                                while let Some(frame) = p_raw.recv_raw_frame().await {
+                                    n += 1;
+                                    if n == 1 || n % 30 == 0 {
+                                        tracing::info!(
+                                            "raw frame {}x{} {} (#{n})",
+                                            frame.width, frame.height, frame.encoding
+                                        );
+                                    }
+                                }
+                            });
+                        }
                         peer = Some(p);
                         session = Some(s);
                         dc_open = false;
