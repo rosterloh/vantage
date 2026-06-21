@@ -45,6 +45,11 @@ async fn main() -> Result<()> {
     let mut dc_open = false;
     let mut sampler = Sampler::new();
 
+    // Construct the ROS bridge once and share it across client sessions. The
+    // bridge spins its own executor on a dedicated thread (see CameraBridge::new).
+    #[cfg(feature = "ros")]
+    let ros_bridge = Arc::new(ros::CameraBridge::new()?);
+
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
 
@@ -59,8 +64,30 @@ async fn main() -> Result<()> {
                     Some(ServerMsg::ClientConnected { session: s }) => {
                         tracing::info!("client connected: {s}");
                         let p = Arc::new(Peer::new(&ice, Role::Robot)?); // offerer creates data channel + offer
-                        // Drain the raw (pre-encode) branch so its channel doesn't grow,
-                        // and log counts to prove it runs alongside the WebRTC stream.
+                        // Drain the raw (pre-encode) branch concurrently with the
+                        // WebRTC stream. recv_raw_frame locks one receiver, so exactly
+                        // one drain owns it — selected at compile time by the feature.
+                        #[cfg(feature = "ros")]
+                        {
+                            let p_raw = p.clone();
+                            let bridge = ros_bridge.clone();
+                            tokio::spawn(async move {
+                                let mut n: u64 = 0;
+                                while let Some(frame) = p_raw.recv_raw_frame().await {
+                                    n += 1;
+                                    let (w, h) = (frame.width, frame.height);
+                                    match bridge.publish(frame) {
+                                        Ok(()) => {
+                                            if n == 1 || n % 30 == 0 {
+                                                tracing::info!("published ros image {w}x{h} (#{n})");
+                                            }
+                                        }
+                                        Err(e) => tracing::warn!("ros publish failed: {e}"),
+                                    }
+                                }
+                            });
+                        }
+                        #[cfg(not(feature = "ros"))]
                         {
                             let p_raw = p.clone();
                             tokio::spawn(async move {
