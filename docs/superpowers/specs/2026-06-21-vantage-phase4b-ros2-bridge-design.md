@@ -1,6 +1,6 @@
 # Vantage Phase 4b — ROS 2 Bridge (camera → `sensor_msgs/Image`) Design
 
-**Status:** Approved design (brainstorming output). Next: implementation plan via writing-plans.
+**Status:** Approved. Implementation plan: `docs/superpowers/plans/2026-06-21-vantage-phase4b-ros2-bridge.md`.
 **Date:** 2026-06-21
 **Builds on:** Phase 4a (`docs/superpowers/plans/2026-06-19-vantage-phase4a-camera-tee-encoder.md`),
 merged to `main`. The robot's pre-encode `tee` already exposes raw RGB frames via
