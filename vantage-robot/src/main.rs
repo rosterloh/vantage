@@ -3,6 +3,9 @@ mod telemetry;
 #[allow(dead_code)] // used by ros/mod.rs under --features ros; exercised by unit tests otherwise
 mod convert;
 
+#[cfg(feature = "ros")]
+mod ros;
+
 use std::sync::Arc;
 use std::time::Duration;
 

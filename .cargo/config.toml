@@ -1,0 +1,29 @@
+# ROS 2 Lyrical patch sources for the optional `ros` feature of vantage-robot.
+#
+# Why this is always-on (not gated to the ROS build): cargo resolves even
+# DISABLED optional dependencies into the shared workspace lock, and
+# `sensor_msgs` has no usable crates.io release. Without these patches,
+# `cargo build --workspace` fails to resolve `sensor_msgs` even with the
+# `ros` feature off. So the patch must be visible to every invocation.
+#
+# Consequence (tracked debt, Phase 4b decision "Option C"): the default
+# workspace build now REQUIRES these paths to exist at resolve time, so it no
+# longer builds on a machine without ROS 2 Lyrical installed. The `ros`
+# feature is still off by default (nothing ROS is COMPILED into the default
+# binary). Restore a fully ROS-free default lane later by either:
+#   - repointing `rclrs` at ros2-rust/ros2_rust#640 once it publishes Lyrical
+#     crates (then move these to a ROS-only `--config` file), or
+#   - splitting the bridge into a separate excluded crate/process.
+#
+# `rclrs` points at the local Lyrical shim in ~/ros2_ws (2-file lyrical->rolling
+# patch on upstream #641) per the Phase 4b "point at ~/ros2_ws for now" decision.
+# The message crates are the native rosidl-generated Rust crates installed by
+# the apt ROS packages under /opt/ros/lyrical (stable path).
+
+[patch.crates-io]
+rclrs = { path = "/home/rosterloh/ros2_ws/src/ros2_rust/rclrs" }
+sensor_msgs = { path = "/opt/ros/lyrical/share/sensor_msgs/rust" }
+std_msgs = { path = "/opt/ros/lyrical/share/std_msgs/rust" }
+geometry_msgs = { path = "/opt/ros/lyrical/share/geometry_msgs/rust" }
+builtin_interfaces = { path = "/opt/ros/lyrical/share/builtin_interfaces/rust" }
+service_msgs = { path = "/opt/ros/lyrical/share/service_msgs/rust" }
