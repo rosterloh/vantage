@@ -6,6 +6,7 @@ mod convert;
 #[cfg(feature = "ros")]
 mod ros;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,8 @@ use anyhow::Result;
 use vantage_protocol::codec;
 use vantage_protocol::signalling::{IceServer, RobotInfo, RobotMsg, ServerMsg};
 use vantage_protocol::{RobotId, SessionId};
-use vantage_signalling::peer::{Peer, PeerEvent, Role};
+use vantage_signalling::peer::PeerEvent;
+use vantage_signalling::robot_media::{Consumer, RobotMedia};
 use vantage_signalling::ws::CoordinatorWs;
 
 use telemetry::Sampler;
@@ -40,22 +42,70 @@ async fn main() -> Result<()> {
     .await?;
     tracing::info!("registered as {id}");
 
-    let mut peer: Option<Arc<Peer>> = None;
-    let mut session: Option<SessionId> = None;
-    let mut dc_open = false;
+    // ONE shared capture/encode engine: camera → tee → encode-once → rtptee fan-out,
+    // plus the raw pre-encode branch. Built (and PLAYed) once; encoder runs once.
+    let media = Arc::new(RobotMedia::new(&ice)?);
+    let mut consumers: HashMap<SessionId, Consumer> = HashMap::new();
+    // Sessions whose telemetry data channel is open.
+    let mut dc_open: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
     let mut sampler = Sampler::new();
+
+    // Shared, session-tagged event channel: every Consumer forwards its PeerEvents
+    // here so the single loop below selects over all consumers at once.
+    let (events_tx, mut events_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(SessionId, PeerEvent)>();
 
     // Construct the ROS bridge once and share it across client sessions. The
     // bridge spins its own executor on a dedicated thread (see CameraBridge::new).
     #[cfg(feature = "ros")]
     let ros_bridge = Arc::new(ros::CameraBridge::new()?);
 
+    // Drain the raw (pre-encode) branch once, for the engine's lifetime, concurrently
+    // with the WebRTC streams. recv_raw_frame locks one receiver, so exactly one drain
+    // owns it — the active branch is selected at compile time by the `ros` feature.
+    #[cfg(feature = "ros")]
+    {
+        let media_raw = media.clone();
+        let bridge = ros_bridge.clone();
+        tokio::spawn(async move {
+            let mut n: u64 = 0;
+            while let Some(frame) = media_raw.recv_raw_frame().await {
+                n += 1;
+                let (w, h) = (frame.width, frame.height);
+                match bridge.publish(frame) {
+                    Ok(()) => {
+                        if n == 1 || n % 30 == 0 {
+                            tracing::info!("published ros image {w}x{h} (#{n})");
+                        }
+                    }
+                    Err(e) => tracing::warn!("ros publish failed: {e}"),
+                }
+            }
+        });
+    }
+    #[cfg(not(feature = "ros"))]
+    {
+        let media_raw = media.clone();
+        tokio::spawn(async move {
+            let mut n: u64 = 0;
+            while let Some(frame) = media_raw.recv_raw_frame().await {
+                n += 1;
+                if n == 1 || n % 30 == 0 {
+                    tracing::info!(
+                        "raw frame {}x{} {} (#{n})",
+                        frame.width,
+                        frame.height,
+                        frame.encoding
+                    );
+                }
+            }
+        });
+    }
+
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
-        // Clone an Arc for the event future so it does not borrow `peer`.
-        let peer_ev = peer.clone();
         tokio::select! {
             // Coordinator -> robot
             msg = rx.recv::<ServerMsg>() => {
@@ -63,71 +113,35 @@ async fn main() -> Result<()> {
                     None => { tracing::info!("coordinator closed"); break; }
                     Some(ServerMsg::ClientConnected { session: s }) => {
                         tracing::info!("client connected: {s}");
-                        let p = Arc::new(Peer::new(&ice, Role::Robot)?); // offerer creates data channel + offer
-                        // Drain the raw (pre-encode) branch concurrently with the
-                        // WebRTC stream. recv_raw_frame locks one receiver, so exactly
-                        // one drain owns it — selected at compile time by the feature.
-                        #[cfg(feature = "ros")]
-                        {
-                            let p_raw = p.clone();
-                            let bridge = ros_bridge.clone();
-                            tokio::spawn(async move {
-                                let mut n: u64 = 0;
-                                while let Some(frame) = p_raw.recv_raw_frame().await {
-                                    n += 1;
-                                    let (w, h) = (frame.width, frame.height);
-                                    match bridge.publish(frame) {
-                                        Ok(()) => {
-                                            if n == 1 || n % 30 == 0 {
-                                                tracing::info!("published ros image {w}x{h} (#{n})");
-                                            }
-                                        }
-                                        Err(e) => tracing::warn!("ros publish failed: {e}"),
-                                    }
-                                }
-                            });
+                        let c = media.add_consumer(s.clone(), events_tx.clone())?;
+                        consumers.insert(s, c);
+                    }
+                    Some(ServerMsg::ClientDisconnected { session: s }) => {
+                        tracing::info!("client disconnected: {s}");
+                        if let Some(c) = consumers.remove(&s) {
+                            media.remove_consumer(c);
                         }
-                        #[cfg(not(feature = "ros"))]
-                        {
-                            let p_raw = p.clone();
-                            tokio::spawn(async move {
-                                let mut n: u64 = 0;
-                                while let Some(frame) = p_raw.recv_raw_frame().await {
-                                    n += 1;
-                                    if n == 1 || n % 30 == 0 {
-                                        tracing::info!(
-                                            "raw frame {}x{} {} (#{n})",
-                                            frame.width, frame.height, frame.encoding
-                                        );
-                                    }
-                                }
-                            });
-                        }
-                        peer = Some(p);
-                        session = Some(s);
-                        dc_open = false;
+                        dc_open.remove(&s);
                     }
-                    Some(ServerMsg::ClientDisconnected { .. }) => {
-                        tracing::info!("client disconnected");
-                        peer = None; session = None; dc_open = false;
+                    Some(ServerMsg::Signal { from: Some(s), signal }) => {
+                        if let Some(c) = consumers.get(&s) { c.handle_signal(signal)?; }
                     }
-                    Some(ServerMsg::Signal { signal, .. }) => {
-                        if let Some(p) = &peer { p.handle_signal(signal)?; }
-                    }
+                    Some(ServerMsg::Signal { from: None, .. }) => {}
                     Some(ServerMsg::Error { message }) => tracing::warn!("coordinator error: {message}"),
                     _ => {}
                 }
             }
-            // Peer -> coordinator / local
-            ev = async { match &peer_ev { Some(p) => p.recv_event().await, None => std::future::pending().await } } => {
+            // Consumers -> coordinator / local  (merged, session-tagged)
+            ev = events_rx.recv() => {
                 match ev {
-                    Some(PeerEvent::LocalDescription(sig)) | Some(PeerEvent::LocalIce(sig)) => {
-                        if let Some(s) = &session {
-                            tx.send(&RobotMsg::Signal { to: s.clone(), signal: sig }).await?;
-                        }
+                    Some((s, PeerEvent::LocalDescription(sig))) | Some((s, PeerEvent::LocalIce(sig))) => {
+                        tx.send(&RobotMsg::Signal { to: s, signal: sig }).await?;
                     }
-                    Some(PeerEvent::DataChannelOpen) => { tracing::info!("data channel open"); dc_open = true; }
-                    Some(PeerEvent::DataMessage(_)) => { /* reserved: future control channel */ }
+                    Some((s, PeerEvent::DataChannelOpen)) => {
+                        tracing::info!("data channel open: {s}");
+                        dc_open.insert(s);
+                    }
+                    Some((_, PeerEvent::DataMessage(_))) => { /* reserved: future control channel */ }
                     None => {}
                 }
             }
@@ -135,11 +149,11 @@ async fn main() -> Result<()> {
                 tx.send(&RobotMsg::Heartbeat).await?;
             }
             _ = telemetry_tick.tick() => {
-                if dc_open {
-                    if let Some(p) = &peer {
-                        let info = sampler.sample();
-                        let bytes = codec::encode(&info)?;
-                        p.send_data(&bytes)?;
+                let info = sampler.sample();
+                let bytes = codec::encode(&info)?;
+                for (s, c) in &consumers {
+                    if dc_open.contains(s) {
+                        c.send_data(&bytes)?;
                     }
                 }
             }
