@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banners/banner-1-viewport.svg" alt="Vantage — see the robot, read the telemetry, from anywhere" width="100%">
+</p>
+
 # Vantage
 
 Low-latency WebRTC system that lets an operator see a robot's live onboard camera

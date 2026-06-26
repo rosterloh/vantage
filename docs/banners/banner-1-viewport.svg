@@ -1,0 +1,77 @@
+<svg width="1280" height="320" viewBox="0 0 1280 320" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0f1c"/>
+      <stop offset="1" stop-color="#111a2e"/>
+    </linearGradient>
+    <linearGradient id="accent1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx="0.7" cy="0.4" r="0.6">
+      <stop offset="0" stop-color="#0ea5e9" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#0ea5e9" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="320" fill="url(#bg1)"/>
+  <rect width="1280" height="320" fill="url(#glow1)"/>
+
+  <!-- subtle grid -->
+  <g stroke="#1e2c47" stroke-width="1" opacity="0.5">
+    <line x1="0" y1="80" x2="1280" y2="80"/>
+    <line x1="0" y1="160" x2="1280" y2="160"/>
+    <line x1="0" y1="240" x2="1280" y2="240"/>
+    <line x1="160" y1="0" x2="160" y2="320"/>
+    <line x1="320" y1="0" x2="320" y2="320"/>
+    <line x1="960" y1="0" x2="960" y2="320"/>
+    <line x1="1120" y1="0" x2="1120" y2="320"/>
+  </g>
+
+  <!-- LEFT: title block -->
+  <g transform="translate(96,118)">
+    <text x="0" y="0" font-size="76" font-weight="700" fill="#f8fafc" letter-spacing="2">Vantage</text>
+    <rect x="2" y="22" width="118" height="4" rx="2" fill="url(#accent1)"/>
+    <text x="2" y="58" font-size="20" font-weight="500" fill="#94a3b8" letter-spacing="0.5">See the robot. Read the telemetry. From anywhere.</text>
+    <text x="2" y="86" font-size="14.5" font-weight="500" fill="#64748b" letter-spacing="3">LOW-LATENCY · WEBRTC · RUST</text>
+  </g>
+
+  <!-- RIGHT: operator viewport with reticle -->
+  <g transform="translate(820,60)">
+    <rect x="0" y="0" width="360" height="200" rx="10" fill="#060a14" stroke="#22d3ee" stroke-opacity="0.5" stroke-width="1.5"/>
+    <!-- viewport scene: robot silhouette -->
+    <g transform="translate(180,118)">
+      <ellipse cx="0" cy="58" rx="86" ry="14" fill="#0ea5e9" opacity="0.12"/>
+      <!-- robot body -->
+      <rect x="-44" y="-34" width="88" height="64" rx="10" fill="#1e3a5f"/>
+      <rect x="-44" y="-34" width="88" height="64" rx="10" fill="none" stroke="#38bdf8" stroke-width="1.5" opacity="0.7"/>
+      <circle cx="-18" cy="-6" r="9" fill="#22d3ee"/>
+      <circle cx="18" cy="-6" r="9" fill="#22d3ee"/>
+      <rect x="-30" y="14" width="60" height="6" rx="3" fill="#0f2942"/>
+      <!-- wheels -->
+      <circle cx="-30" cy="34" r="11" fill="#0b1626"/>
+      <circle cx="30" cy="34" r="11" fill="#0b1626"/>
+      <circle cx="-30" cy="34" r="11" fill="none" stroke="#38bdf8" stroke-width="1.5" opacity="0.6"/>
+      <circle cx="30" cy="34" r="11" fill="none" stroke="#38bdf8" stroke-width="1.5" opacity="0.6"/>
+    </g>
+    <!-- targeting reticle corners -->
+    <g stroke="#22d3ee" stroke-width="2.5" fill="none" opacity="0.9">
+      <path d="M120 70 h-22 v22"/>
+      <path d="M240 70 h22 v22"/>
+      <path d="M120 156 h-22 v-22"/>
+      <path d="M240 156 h22 v-22"/>
+    </g>
+    <!-- HUD overlays -->
+    <circle cx="22" cy="22" r="5" fill="#34d399"/>
+    <text x="36" y="27" font-size="13" font-weight="600" fill="#cbd5e1" letter-spacing="1">LIVE</text>
+    <text x="338" y="27" font-size="12" font-weight="500" fill="#64748b" text-anchor="end">REC 00:42</text>
+    <!-- telemetry strip -->
+    <g font-size="11.5" font-weight="500" fill="#7dd3fc">
+      <text x="14" y="186">CPU 38%</text>
+      <text x="108" y="186">42°C</text>
+      <text x="168" y="186">12.4V</text>
+      <text x="236" y="186">28ms</text>
+      <text x="318" y="186" text-anchor="end">H.264</text>
+    </g>
+  </g>
+</svg>
