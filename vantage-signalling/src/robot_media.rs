@@ -188,21 +188,29 @@ impl RobotMedia {
         })
     }
 
-    /// Tear down a consumer: unlink its `rtptee` tap and remove its elements.
-    /// Task 2 uses an immediate unlink+remove; Task 3 replaces this with a
-    /// blocking-pad-probe teardown.
+    /// Tear down a consumer via a blocking IDLE pad probe: fires when the
+    /// `rtptee` src pad feeding this consumer is not mid-buffer, guaranteeing
+    /// the unlink/remove is safe on a PLAYING pipeline.
     pub fn remove_consumer(&self, consumer: Consumer) {
-        let qsink = consumer.queue.static_pad("sink");
-        if let Some(qsink) = qsink {
-            let _ = consumer.rtptee_pad.unlink(&qsink);
-        }
-        self.rtptee.release_request_pad(&consumer.rtptee_pad);
+        let Consumer { session, webrtcbin, queue, rtptee_pad, .. } = consumer;
+        tracing::info!("removing consumer {session}");
+        let pipeline = self.pipeline.clone();
+        let rtptee = self.rtptee.clone();
 
-        let _ = consumer.webrtcbin.set_state(gst::State::Null);
-        let _ = consumer.queue.set_state(gst::State::Null);
-        let _ = self
-            .pipeline
-            .remove_many([&consumer.queue, &consumer.webrtcbin]);
+        rtptee_pad.clone().add_probe(gst::PadProbeType::IDLE, move |pad, _info| {
+            // 1. unlink rtptee → queue
+            if let Some(qsink) = queue.static_pad("sink") {
+                let _ = pad.unlink(&qsink);
+            }
+            // 2. remove queue + webrtcbin from the live pipeline and set to Null
+            let _ = pipeline.remove_many([&queue, &webrtcbin]);
+            let _ = queue.set_state(gst::State::Null);
+            let _ = webrtcbin.set_state(gst::State::Null);
+            // 3. release the request pad so rtptee stops producing for it
+            //    (allow-not-linked=true means zero consumers does not error the engine)
+            rtptee.release_request_pad(pad);
+            gst::PadProbeReturn::Remove
+        });
     }
 
     /// Await the next raw camera frame (RGB888) from the pre-encode tee branch.
