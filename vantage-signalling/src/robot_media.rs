@@ -8,6 +8,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_rtp::prelude::*;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
@@ -19,15 +20,6 @@ use crate::peer::{
     configure_ice, parse_sdp, wire_data_channel, wire_local_ice, wire_on_negotiation_needed,
     PeerEvent, RawFrame,
 };
-
-// FFI binding for gst_rtp_header_extension_set_id (from libgstrtp-1.0).
-// The gstreamer-rtp crate is not used in this workspace, but the function is
-// needed to assign a valid extension-id (1-14 for one-byte headers) before
-// calling the payloader's add-extension signal.
-#[link(name = "gstrtp-1.0")]
-unsafe extern "C" {
-    fn gst_rtp_header_extension_set_id(ext: *mut gst::ffi::GstElement, ext_id: u32);
-}
 
 /// The single shared capture/encode engine. Owns the pipeline, the `rtptee`
 /// fan-out point, and the raw pre-encode frame channel. Built (and PLAYed) once
@@ -77,16 +69,14 @@ impl RobotMedia {
 
         // Advertise transport-cc via RTP header extension so the SDP contains
         // `transport-cc` and the client returns TWCC feedback.
-        // Extension ID 3 is a common TWCC assignment; must be set before add-extension.
+        // Set ext-id=3 (valid one-byte range 1-14) before add-extension; the
+        // default u32::MAX fails the element's internal assertion.
         if let Ok(twcc_ext) = gst::ElementFactory::make("rtphdrexttwcc").build() {
-            // SAFETY: twcc_ext is a valid GstRTPHeaderExtension GObject (just created),
-            // and gst_rtp_header_extension_set_id is a stable GStreamer API.
-            // SAFETY: twcc_ext is a valid GstRTPHeaderExtension (just created).
-            // We must set a valid ext_id (1-14) before add-extension; the default
-            // is u32::MAX which fails the element's internal assertion.
-            unsafe {
-                gst_rtp_header_extension_set_id(twcc_ext.as_ptr(), 3);
-            }
+            let ext = twcc_ext
+                .clone()
+                .dynamic_cast::<gstreamer_rtp::RTPHeaderExtension>()
+                .expect("rtphdrexttwcc is an RTPHeaderExtension");
+            ext.set_id(3);
             pay.emit_by_name::<()>("add-extension", &[&twcc_ext]);
             tracing::info!("transport-cc RTP header extension added to payloader (ext-id=3)");
         } else {

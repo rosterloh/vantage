@@ -19,3 +19,4 @@ gstreamer-webrtc = { version = "0.23", features = ["v1_22"] }
 gstreamer-sdp = { version = "0.23", features = ["v1_22"] }
 gstreamer-app = { version = "0.23", features = ["v1_22"] }
 gstreamer-video = { version = "0.23", features = ["v1_22"] }
+gstreamer-rtp = { version = "0.23", features = ["v1_22"] }
