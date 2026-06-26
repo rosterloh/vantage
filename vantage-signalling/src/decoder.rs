@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use gstreamer as gst;
-use gstreamer::prelude::*;
 
 /// Ordered H.264 decoder candidates: hardware first, software (`avdec_h264`) last.
 /// nvh264dec / nvdec (NVIDIA) → vah264dec / vaapih264dec (Intel/AMD VAAPI) →
@@ -42,6 +41,7 @@ pub fn make_h264_decoder() -> Result<gst::Element> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gstreamer::prelude::*;
 
     #[test]
     fn factory_builds_an_available_decoder() {
