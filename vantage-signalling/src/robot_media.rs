@@ -20,12 +20,22 @@ use crate::peer::{
     PeerEvent, RawFrame,
 };
 
+// FFI binding for gst_rtp_header_extension_set_id (from libgstrtp-1.0).
+// The gstreamer-rtp crate is not used in this workspace, but the function is
+// needed to assign a valid extension-id (1-14 for one-byte headers) before
+// calling the payloader's add-extension signal.
+#[link(name = "gstrtp-1.0")]
+unsafe extern "C" {
+    fn gst_rtp_header_extension_set_id(ext: *mut gst::ffi::GstElement, ext_id: u32);
+}
+
 /// The single shared capture/encode engine. Owns the pipeline, the `rtptee`
 /// fan-out point, and the raw pre-encode frame channel. Built (and PLAYed) once
 /// at robot startup; each connecting client adds a `Consumer` tapped off `rtptee`.
 pub struct RobotMedia {
     pipeline: gst::Pipeline,
     rtptee: gst::Element,
+    enc: gst::Element,
     ice_servers: Vec<IceServer>,
     raw_frames_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RawFrame>>,
 }
@@ -64,6 +74,24 @@ impl RobotMedia {
             .property("config-interval", -1i32)
             .property("pt", 96u32)
             .build()?;
+
+        // Advertise transport-cc via RTP header extension so the SDP contains
+        // `transport-cc` and the client returns TWCC feedback.
+        // Extension ID 3 is a common TWCC assignment; must be set before add-extension.
+        if let Ok(twcc_ext) = gst::ElementFactory::make("rtphdrexttwcc").build() {
+            // SAFETY: twcc_ext is a valid GstRTPHeaderExtension GObject (just created),
+            // and gst_rtp_header_extension_set_id is a stable GStreamer API.
+            // SAFETY: twcc_ext is a valid GstRTPHeaderExtension (just created).
+            // We must set a valid ext_id (1-14) before add-extension; the default
+            // is u32::MAX which fails the element's internal assertion.
+            unsafe {
+                gst_rtp_header_extension_set_id(twcc_ext.as_ptr(), 3);
+            }
+            pay.emit_by_name::<()>("add-extension", &[&twcc_ext]);
+            tracing::info!("transport-cc RTP header extension added to payloader (ext-id=3)");
+        } else {
+            tracing::warn!("rtphdrexttwcc not found — transport-cc disabled");
+        }
         let rtpcaps = gst::ElementFactory::make("capsfilter")
             .property(
                 "caps",
@@ -99,6 +127,7 @@ impl RobotMedia {
         Ok(Self {
             pipeline,
             rtptee,
+            enc,
             ice_servers: ice_servers.to_vec(),
             raw_frames_rx: tokio::sync::Mutex::new(raw_frames_rx),
         })
@@ -167,6 +196,49 @@ impl RobotMedia {
         let qsink = queue.static_pad("sink").context("queue has no sink pad")?;
         rtptee_pad.link(&qsink)?;
 
+        // transport-cc adaptive bitrate: attach rtpgccbwe as an aux sender so
+        // the encoder bitrate tracks the GCC estimate.
+        //
+        // GUARD: check for factory availability BEFORE connecting the signal.
+        // request-aux-sender REQUIRES a non-None GstElement return; returning None
+        // panics in GLib's closure marshaller. So we only connect when the factory
+        // is confirmed present. On this host rtpgccbwe is absent → log once, skip.
+        if gst::ElementFactory::find("rtpgccbwe").is_some() {
+            let enc_weak = self.enc.downgrade();
+            webrtcbin.connect("request-aux-sender", false, move |_vals| {
+                let gcc = match gst::ElementFactory::make("rtpgccbwe").build() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        // Factory was found but build failed — unexpected; log and
+                        // fall through. We can't return None here, but this path is
+                        // unreachable if the factory-find guard above passed.
+                        tracing::error!("rtpgccbwe build failed after factory found");
+                        return Some(gst::ElementFactory::make("identity").build().unwrap().to_value());
+                    }
+                };
+                let enc_weak = enc_weak.clone();
+                gcc.connect("notify::estimated-bitrate", false, move |args| {
+                    let gcc_el = args[0].get::<gst::Element>().ok()?;
+                    let bps: u32 = gcc_el.property("estimated-bitrate");
+                    // x264enc bitrate is in kbit/s; clamp to 300–2500 kbit/s.
+                    let kbps = (bps / 1000).clamp(300, 2500);
+                    if let Some(enc) = enc_weak.upgrade() {
+                        enc.set_property("bitrate", kbps);
+                        tracing::debug!(
+                            "adaptive bitrate: {kbps} kbit/s (estimate {bps} bit/s)"
+                        );
+                    }
+                    None
+                });
+                tracing::info!("rtpgccbwe attached — adaptive bitrate active");
+                Some(gcc.to_value())
+            });
+        } else {
+            tracing::warn!(
+                "rtpgccbwe absent — static bitrate (adaptive bitrate host-deferred)"
+            );
+        }
+
         // telemetry data channel + offer  (robot is offerer, reusing peer.rs glue)
         let dc = webrtcbin
             .emit_by_name_with_values(
@@ -178,6 +250,23 @@ impl RobotMedia {
             .context("create-data-channel returned null")?;
         wire_data_channel(&dc, &tx);
         wire_on_negotiation_needed(&webrtcbin, &tx);
+
+        // Force a keyframe so the new viewer gets an IDR immediately instead of
+        // waiting up to ~1 s for the periodic IDR (key-int-max=30 @30fps).
+        // Send the event upstream from the encoder's src pad — more reliable than
+        // the rtptee pad for x264enc, which handles it at its output.
+        let fku = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        let enc_src = self.enc.static_pad("src");
+        let sent = enc_src
+            .as_ref()
+            .is_some_and(|p| p.send_event(fku));
+        if !sent {
+            tracing::warn!("force-key-unit not handled (new viewer waits for periodic IDR)");
+        } else {
+            tracing::debug!("force-key-unit sent to encoder for new consumer {session}");
+        }
 
         Ok(Consumer {
             session,
