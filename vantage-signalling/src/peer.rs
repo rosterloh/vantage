@@ -451,7 +451,7 @@ fn build_decode_branch(
 ) -> Result<()> {
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
     let parse = gst::ElementFactory::make("h264parse").build()?;
-    let dec = gst::ElementFactory::make("avdec_h264").build()?;
+    let dec = crate::decoder::make_h264_decoder()?;
     let convert = gst::ElementFactory::make("videoconvert").build()?;
 
     let appsink = gst_app::AppSink::builder()
