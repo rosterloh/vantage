@@ -1,5 +1,10 @@
 # Vantage Phase 4b — ROS 2 Bridge (camera → `sensor_msgs/Image`) Design
 
+> **Superseded in part (2026-06-26):** the `rclrs` + always-on-`.cargo`-patch toolchain described
+> below ("Environment & toolchain", "Cargo features") was replaced with git-pinned `r2r` before
+> merge — no shim, no patch, no message-crate deps. The architecture/conversion contract/topics are
+> unchanged. See the exit note's "Addendum 2026-06-26" and memory `vantage-r2r-vs-rclrs-tradeoffs`.
+
 **Status:** Approved. Implementation plan: `docs/superpowers/plans/2026-06-21-vantage-phase4b-ros2-bridge.md`.
 **Date:** 2026-06-21
 **Builds on:** Phase 4a (`docs/superpowers/plans/2026-06-19-vantage-phase4a-camera-tee-encoder.md`),

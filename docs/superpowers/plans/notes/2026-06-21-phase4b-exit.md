@@ -83,3 +83,38 @@ subscriber-delivery test.
 - Tasks 1–3 complete and review-clean; publish-side Task 4 proven above.
 - Deferred: subscriber-delivery (blocked by the shim issue above), Docker/CI two-lane harness,
   and a fully ROS-free default lane (all tracked).
+
+---
+
+## Addendum 2026-06-26 — switched rclrs → r2r; SIGSEGV blocker resolved
+
+The "Option C" rclrs arrangement above was **replaced with `r2r`** before merge (the simpler tooling
+won out for a publish-only bridge). `r2r` generates rcl + message bindings at build time from the
+sourced ROS env, so the always-on `.cargo/config.toml` patch, the `~/ros2_ws` local shim, and the
+`sensor_msgs`/`rclrs` crates.io deps are all **gone**. `vantage-robot/src/ros/mod.rs` now uses
+`r2r` (git-pinned to rev `2d080c4` = r2r 0.9.6-dev, since crates.io 0.9.5 predates Lyrical and
+rejects `ROS_DISTRO=lyrical`); `convert.rs`/`main.rs` unchanged. Rationale + tradeoffs in project
+memory `vantage-r2r-vs-rclrs-tradeoffs`.
+
+**The SIGSEGV "Known issue" above is resolved**, not deferred. r2r links native `rcl` directly,
+bypassing the rolling-introspection typesupport path that faulted. Re-verified 2026-06-26 with a
+temporary standalone driver (since reverted):
+
+```
+$ ros2 topic hz /vantage_camera/image_raw     # matched a real subscriber — the path that SIGSEGV'd
+average rate: 29.716   (image_raw)
+average rate: 29.818   (camera_info)
+$ ros2 topic echo --once /vantage_camera/image_raw --field step   → 1920   (= width*3 ✓)
+                                                   --field encoding → rgb8
+                                                   --field width/height → 640 / 480
+```
+
+Ran 142k+ frames overnight across subscriber connect/disconnect with **zero segfault/panic**.
+
+**Side effect:** dropping the cargo patch restores the fully ROS-free default lane —
+`cargo build/test --workspace` no longer needs `/opt/ros/lyrical` at resolve time (r2r's build.rs
+only runs under `--features ros`). That deferred item is now also closed.
+
+**Still genuinely deferred:** live WebRTC→`recv_raw_frame()` end-to-end on hardware (this addendum
+used synthetic frames; the frame-production side is unchanged from 4a), and the Docker/CI two-lane
+harness.
