@@ -93,8 +93,8 @@ pub fn camera_info_parts(frame: &RawFrame) -> CameraInfoParts;
 ```
 
 `ros/mod.rs` maps `ImageParts`/`CameraInfoParts` → `sensor_msgs::msg::{Image, CameraInfo}`, stamping
-`header.stamp` from the node clock and `header.frame_id` from `VANTAGE_CAMERA_FRAME_ID`
-(default `"camera_optical_frame"`).
+`header.stamp` from the system clock (`SystemTime::now()` — not the ROS node clock; see the bridge's
+`now_secs_nanos`) and `header.frame_id` from `VANTAGE_CAMERA_FRAME_ID` (default `"camera_optical_frame"`).
 
 ### Wiring (`main.rs`, the `ClientConnected` arm)
 

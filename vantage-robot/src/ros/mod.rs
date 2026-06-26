@@ -90,5 +90,5 @@ fn now_secs_nanos() -> (i32, u32) {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    (d.as_secs() as i32, d.subsec_nanos())
+    (d.as_secs().min(i32::MAX as u64) as i32, d.subsec_nanos())
 }
