@@ -12,3 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 gstreamer = { version = "0.23", features = ["v1_22"] }
+gstreamer-webrtc = { version = "0.23", features = ["v1_22"] }
+gstreamer-rtp = { version = "0.23", features = ["v1_22"] }

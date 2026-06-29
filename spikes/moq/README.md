@@ -21,51 +21,65 @@ No RTP payloader, no SDP, no ICE. The relay is always in the path (publisher and
 subscriber both dial out to it). `tls-disable-verify=true` lets the client trust
 the relay's self-signed dev cert with no fingerprint dance.
 
-## Result (localhost loopback, single subscriber)
+## How latency is measured
 
-`src/main.rs` runs publisher + subscriber in one process and timestamps each
-H.264 access unit at the `moqsink` boundary and again as it leaves `moqsrc`,
-matching frames by PTS. Measured between post-encode and pre-decode, so it is the
-**MoQ transport contribution only** (encode/decode excluded — those are identical
-for WebRTC and MoQ).
+Both probes run publisher + subscriber **in one process** and timestamp each frame
+at the post-encode boundary and again pre-decode, so they report the **transport
+contribution only** (encode/decode excluded — identical for both):
 
-```
-matched_frames=360 unmatched_sent=0
-MoQ transport latency (ms): min=0.4 p50=0.8 mean=0.8 p90=1.0 p99=1.4 max=20.9
-```
+- `src/main.rs` (`moq-lat`): H.264 AU at `moqsink` → `moqsrc`, matched by PTS.
+- `src/bin/webrtc-lat.rs` (`webrtc-lat`): two `webrtcbin`s, in-process SDP/ICE,
+  matched by **RTP timestamp** (webrtcbin re-times PTS on receive). The match point
+  is `webrtcbin`'s output — so it **includes the jitter buffer**, which is part of
+  how WebRTC delivers media.
 
-- **Zero loss** (360/360 over 12 s) — QUIC is reliable+ordered.
-- **Sub-millisecond median** transport overhead on loopback.
-- The 20.9 ms `max` is the one-off connection/first-keyframe setup.
+Network conditions are emulated with `netem` on the host loopback. Note the
+topology asymmetry, which is the whole point: **MoQ media crosses the relay (2 lo
+hops); WebRTC is direct P2P (1 hop).**
 
-## What this does NOT prove (and why it matters)
+## Results — `./compare.sh`, 10 s/run, single subscriber, 1500 kbit/s H.264
 
-This is the honest part — loopback flatters MoQ and is **not** where the
-WebRTC-vs-MoQ tradeoff lives:
+| netem on `lo`        | transport | p50 | p90 | p99 | max | delivered |
+|----------------------|-----------|----:|----:|----:|----:|-----------|
+| **clean**            | MoQ       | 0.8 | 1.0 | 1.4 | 25  | 300/300 |
+|                      | WebRTC    | 28.9| 31.6| 32.3| 33  | 299/300 |
+| **25ms delay, 1% loss** | MoQ    | 51.1| 51.4|**340**|**431**| 299/300 |
+|                      | WebRTC    | 54.8| 56.8| 57.4| 58  | 296/300 |
+| **5% loss**          | MoQ       | 0.8 | 29.3| 31.6| 63  | 300/300 |
+|                      | WebRTC    | 29.4| 60.6|**406**|**413**| 281/300 |
+| **50ms delay**       | MoQ       |101.0|101.5|**742**|830| 297/300 |
+|                      | WebRTC    | 78.9| 81.6| 82.3| 87  | 298/300 |
 
-1. **No real network.** On localhost both MoQ and WebRTC show sub-ms transport
-   latency. The real differentiators only appear with RTT + loss:
-   - MoQ keeps a **relay in the path** → adds the operator↔relay↔robot RTT. On a
-     LAN, `webrtcbin`'s ICE gives a *direct* host-to-host hop with no relay.
-   - Under loss, WebRTC plays through with concealment (unreliable RTP + NACK/PLI);
-     QUIC retransmits in-order (head-of-line risk). Not exercised here.
-2. **No congestion control / adaptive bitrate.** Vantage's robot already runs
-   transport-cc + `rtpgccbwe` (300–2500 kbit/s) via `webrtcbin`. MoQ gives none of
-   that for free — this spike sends a fixed 1500 kbit/s. That machinery would have
-   to be rebuilt.
-3. **Single subscriber.** MoQ's relay-side fan-out (its main draw for Phase 5) is
-   untested here.
+(all latencies ms)
 
-### Next step to make it decisive
+### What this shows
 
-Add artificial delay+loss on the relay path and re-measure both transports:
+1. **The relay costs a hop.** Under N ms one-way delay, MoQ's floor is **2×N**
+   (50ms→101, 25ms→51) because media goes endpoint→relay→endpoint; WebRTC's floor
+   is **1×N** (50ms→79, 25ms→55) via a direct hop. On a LAN where the relay is
+   off-site, this is the dominant cost and it has no MoQ workaround short of
+   colocating a relay.
 
-```
-sudo tc qdisc add dev lo root netem delay 25ms loss 1%   # then run.sh; undo with `tc qdisc del dev lo root`
-```
+2. **Jitter buffer vs no buffer.** On a clean link MoQ delivers in ~0.8ms while
+   `webrtcbin` adds ~29ms — but that buffer is *why* WebRTC stays tight under loss.
 
-and build the equivalent `webrtcbin`-loopback probe for an apples-to-apples
-number under the same netem profile.
+3. **Loss is where they diverge hardest.** QUIC is reliable+ordered, so MoQ
+   delivers everything (300/300 even at 5% loss) **but a lost packet stalls the
+   stream waiting for retransmit** → p99 blows out to 340–740ms (head-of-line).
+   WebRTC drops/conceals late frames (down to 281/300) to **keep latency bounded**
+   (tight p99 under delay+loss). For live teleop, bounded latency usually beats
+   guaranteed delivery — advantage WebRTC, and MoQ would need app-level
+   frame-dropping to compete.
+
+## What this still does NOT cover
+
+- **No congestion control / adaptive bitrate.** Vantage's robot already runs
+  transport-cc + `rtpgccbwe` (300–2500 kbit/s) via `webrtcbin`; MoQ gives none of
+  that for free (this spike is fixed 1500 kbit/s). On a degrading link WebRTC backs
+  off; MoQ here would just keep overshooting.
+- **Single subscriber** — MoQ's relay-side fan-out (its main Phase 5 draw) is not
+  tested; this measures the last-hop latency tradeoff, where WebRTC is favoured.
+- Loopback RTT is symmetric/clean vs a real relay's geography and cross-traffic.
 
 ## Setup cost (itself a finding)
 
@@ -82,7 +96,10 @@ versions if this ever graduates past a spike.
 
 ```bash
 cd spikes/moq
-./run.sh            # clones+builds moq into ./.moq, starts relay, runs probe
+./run.sh            # clones+builds moq into ./.moq, starts relay, runs the MoQ probe
+./compare.sh        # full MoQ-vs-WebRTC netem matrix (needs docker for unprivileged netem on lo)
 # or point at an existing checkout:
 MOQ_DIR=~/src/moq SECS=20 ./run.sh
 ```
+
+Probes: `moq-lat` (MoQ) and `webrtc-lat` (webrtcbin baseline) — `cargo run --release --bin <name>`.
