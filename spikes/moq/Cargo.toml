@@ -1,0 +1,14 @@
+# Standalone — empty [workspace] keeps this out of the vantage workspace.
+[workspace]
+
+[package]
+name = "moq-lat"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "moq-lat"
+path = "src/main.rs"
+
+[dependencies]
+gstreamer = { version = "0.23", features = ["v1_22"] }
