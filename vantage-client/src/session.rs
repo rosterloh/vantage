@@ -2,7 +2,7 @@ use anyhow::Result;
 use vantage_protocol::codec;
 use vantage_protocol::signalling::{ClientMsg, IceServer, ServerMsg};
 use vantage_protocol::telemetry::DeviceInfo;
-use vantage_signalling::peer::{Peer, PeerEvent, Role, VideoFrame};
+use vantage_signalling::peer::{Peer, PeerEvent, VideoFrame};
 use vantage_signalling::ws::CoordinatorWs;
 
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub async fn run_session(coord: String, ui: Arc<dyn UiSink>) -> Result<()> {
     ws.send(&ClientMsg::Connect { robot: target.id.clone() }).await?;
 
     let ice = fetch_ice(&coord).await?;
-    let peer = Arc::new(Peer::new(&ice, Role::Client)?);
+    let peer = Arc::new(Peer::new(&ice)?);
 
     // Frame pump: decoded frames -> UI.
     {
