@@ -71,15 +71,46 @@ hops); WebRTC is direct P2P (1 hop).**
    guaranteed delivery — advantage WebRTC, and MoQ would need app-level
    frame-dropping to compete.
 
+## Congestion / adaptive bitrate — `./congestion.sh`
+
+Encoder targets **4000 kbit/s** of incompressible noise (`pattern=snow`, so x264
+actually emits it) into a **2 Mbit/s** capped pipe — 2× oversubscription, 30 s.
+WebRTC's adaptive path replicates vantage's exact wiring: TWCC header extension +
+`rtpgccbwe` driving `x264enc` bitrate. (`rtpgccbwe` ships in gst-plugins-rs and is
+**not installed by default** — vantage guards for its absence, so adaptive bitrate
+is currently host-deferred there too; `congestion.sh` builds it.)
+
+| path | final enc | p50 | early→late | matched | verdict |
+|------|----------:|----:|-----------|--------:|---------|
+| **MoQ** (fixed, no CC)        | 4000 | 11309 | 2505 → **19114** | 75/900 | unbounded bufferbloat, collapses |
+| **WebRTC ADAPT=0** (fixed)    | 4000 | 1082  | stalled (3 frames) | 3 | encoder blocks, unusable |
+| **WebRTC ADAPT=1** (rtpgccbwe)| **667** | **25** | 2740 → **24** | 432/? | overshoots, then **recovers** |
+
+(latency ms)
+
+**The finding:** with no media-level congestion control, fixed bitrate over a
+too-small pipe is fatal. MoQ is the worst case — QUIC reliably **queues every
+frame**, so latency grows without bound (2.5s→19s) and throughput collapses
+(75 frames in 30s). Note QUIC *has* transport congestion control, but that paces
+the bytestream; it does **not** reduce the media rate, so the app-level queue still
+explodes. WebRTC's `rtpgccbwe` reads TWCC feedback, **backs the encoder down to
+667 kbit/s to fit the pipe, and latency recovers from a 2.7s overshoot to a 24ms
+steady state** (`late=24`). MoQ gives none of this for free: `moqsink` exposes an
+`estimated-send-bitrate` *property* (a signal) but no automatic encoder control —
+you'd build the entire feedback loop yourself.
+
 ## What this still does NOT cover
 
-- **No congestion control / adaptive bitrate.** Vantage's robot already runs
-  transport-cc + `rtpgccbwe` (300–2500 kbit/s) via `webrtcbin`; MoQ gives none of
-  that for free (this spike is fixed 1500 kbit/s). On a degrading link WebRTC backs
-  off; MoQ here would just keep overshooting.
 - **Single subscriber** — MoQ's relay-side fan-out (its main Phase 5 draw) is not
   tested; this measures the last-hop latency tradeoff, where WebRTC is favoured.
 - Loopback RTT is symmetric/clean vs a real relay's geography and cross-traffic.
+- GCC convergence needs a non-catastrophic cap; at 3× oversubscription the feedback
+  loop itself drowns and even the adaptive path can't recover.
+
+## Probe knobs
+
+`SECS`, `BITRATE` (kbit/s), `PATTERN` (videotestsrc), and for `webrtc-lat`:
+`ADAPT=1` (attach rtpgccbwe, needs the rsrtp plugin on `GST_PLUGIN_PATH_1_0`).
 
 ## Setup cost (itself a finding)
 
@@ -98,6 +129,7 @@ versions if this ever graduates past a spike.
 cd spikes/moq
 ./run.sh            # clones+builds moq into ./.moq, starts relay, runs the MoQ probe
 ./compare.sh        # full MoQ-vs-WebRTC netem matrix (needs docker for unprivileged netem on lo)
+./congestion.sh     # adaptive-bitrate test (builds rtpgccbwe from gst-plugins-rs)
 # or point at an existing checkout:
 MOQ_DIR=~/src/moq SECS=20 ./run.sh
 ```

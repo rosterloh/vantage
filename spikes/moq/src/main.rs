@@ -14,6 +14,8 @@ fn main() {
     let url = std::env::var("MOQ_URL").unwrap_or_else(|_| "https://localhost:4443".into());
     let bc = "spike.hang";
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    let bitrate: u32 = std::env::var("BITRATE").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let pattern = std::env::var("PATTERN").unwrap_or_else(|_| "ball".into());
 
     let sent: Arc<Mutex<HashMap<u64, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let lats: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -27,8 +29,8 @@ fn main() {
     let epoch: Arc<Mutex<Option<gst::ClockTime>>> = Arc::new(Mutex::new(None));
 
     let tx_desc = format!(
-        "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=480,framerate=30/1 ! \
-         x264enc tune=zerolatency bitrate=1500 key-int-max=30 ! h264parse config-interval=-1 ! \
+        "videotestsrc is-live=true pattern={pattern} ! video/x-raw,width=640,height=480,framerate=30/1 ! \
+         x264enc tune=zerolatency bitrate={bitrate} key-int-max=30 ! h264parse config-interval=-1 ! \
          video/x-h264,stream-format=byte-stream,alignment=au ! identity name=tx ! \
          moqsink url={url} broadcast={bc} tls-disable-verify=true"
     );
@@ -103,19 +105,23 @@ fn main() {
     println!("tx_buffers={} rx_buffers={}", *tx_n.lock().unwrap(), *rx_n.lock().unwrap());
     println!("tx_pts_ms_sample={:?}", *tx_samp.lock().unwrap());
     println!("rx_pts_ms_sample={:?}", *rx_samp.lock().unwrap());
-    let mut v = lats.lock().unwrap().clone();
+    let arr = lats.lock().unwrap().clone(); // arrival order
     let unmatched = sent.lock().unwrap().len();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
+    let n = arr.len();
     if n == 0 {
         println!("NO MATCHED FRAMES (unmatched_sent={unmatched}) — PTS mismatch or no delivery");
         return;
     }
+    let win = (n / 5).max(1);
+    let mean_of = |s: &[f64]| s.iter().sum::<f64>() / s.len() as f64;
+    let early = mean_of(&arr[..win]);
+    let late = mean_of(&arr[n - win..]);
+    let mut v = arr.clone();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pct = |q: f64| v[(((n - 1) as f64) * q).round() as usize];
-    let mean = v.iter().sum::<f64>() / n as f64;
     println!("matched_frames={n} unmatched_sent={unmatched}");
     println!(
-        "MoQ transport latency (ms): min={:.1} p50={:.1} mean={:.1} p90={:.1} p99={:.1} max={:.1}",
-        v[0], pct(0.50), mean, pct(0.90), pct(0.99), v[n - 1]
+        "MoQ transport latency (ms): p50={:.1} p90={:.1} p99={:.1} max={:.1} | early={:.1} late={:.1} (bufferbloat if late>>early)",
+        pct(0.50), pct(0.90), pct(0.99), v[n - 1], early, late
     );
 }

@@ -5,8 +5,9 @@
 use gstreamer as gst;
 use gstreamer_webrtc as gst_webrtc;
 use gstreamer_rtp::RTPBuffer;
-use gst::prelude::*;
+use gstreamer_rtp::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,17 +16,63 @@ fn none_promise() -> Option<gst::Promise> { None }
 fn main() {
     gst::init().unwrap();
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    let bitrate: u32 = std::env::var("BITRATE").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let adapt: bool = std::env::var("ADAPT").map(|v| v == "1").unwrap_or(false);
+    let pattern = std::env::var("PATTERN").unwrap_or_else(|_| "ball".into());
 
-    let desc = "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=480,framerate=30/1 ! \
-        x264enc tune=zerolatency bitrate=1500 key-int-max=30 ! h264parse config-interval=-1 ! \
+    let desc = format!(
+        "videotestsrc is-live=true pattern={pattern} ! video/x-raw,width=640,height=480,framerate=30/1 ! \
+        x264enc name=enc tune=zerolatency bitrate={bitrate} key-int-max=30 ! h264parse config-interval=-1 ! \
         rtph264pay name=pay pt=96 config-interval=1 aggregate-mode=zero-latency ! \
         application/x-rtp,media=video,encoding-name=H264,payload=96 ! \
         webrtcbin name=sendbin bundle-policy=max-bundle latency=0 \
-        webrtcbin name=recvbin bundle-policy=max-bundle latency=0";
+        webrtcbin name=recvbin bundle-policy=max-bundle latency=0"
+    );
 
-    let pipeline = gst::parse::launch(desc).unwrap().downcast::<gst::Pipeline>().unwrap();
+    let pipeline = gst::parse::launch(&desc).unwrap().downcast::<gst::Pipeline>().unwrap();
     let sendbin = pipeline.by_name("sendbin").unwrap();
     let recvbin = pipeline.by_name("recvbin").unwrap();
+    let enc = pipeline.by_name("enc").unwrap();
+    let pay = pipeline.by_name("pay").unwrap();
+    let cur_bitrate = Arc::new(AtomicU32::new(bitrate));
+
+    // transport-cc header extension (ext-id=3) so the receiver returns TWCC
+    // feedback — exactly as vantage-signalling wires it.
+    if let Ok(twcc) = gst::ElementFactory::make("rtphdrexttwcc").build() {
+        let ext = twcc.clone().dynamic_cast::<gstreamer_rtp::RTPHeaderExtension>().unwrap();
+        ext.set_id(3);
+        pay.emit_by_name::<()>("add-extension", &[&twcc]);
+    }
+
+    // ADAPT=1: attach rtpgccbwe as aux sender and drive x264enc bitrate from the
+    // GCC estimate (clamped 300..target), same as vantage-signalling.
+    if adapt {
+        if gst::ElementFactory::find("rtpgccbwe").is_some() {
+            let enc_weak = enc.downgrade();
+            let cur = cur_bitrate.clone();
+            sendbin.connect("request-aux-sender", false, move |_| {
+                let gcc = gst::ElementFactory::make("rtpgccbwe").build().unwrap();
+                gcc.set_property("min-bitrate", 300_000u32);
+                gcc.set_property("max-bitrate", bitrate * 1000);
+                let enc_weak = enc_weak.clone();
+                let cur = cur.clone();
+                gcc.connect("notify::estimated-bitrate", false, move |args| {
+                    let gcc_el = args[0].get::<gst::Element>().ok()?;
+                    let bps: u32 = gcc_el.property("estimated-bitrate");
+                    let kbps = (bps / 1000).clamp(300, bitrate);
+                    if let Some(enc) = enc_weak.upgrade() {
+                        enc.set_property("bitrate", kbps);
+                        cur.store(kbps, Ordering::Relaxed);
+                    }
+                    None
+                });
+                Some(gcc.to_value())
+            });
+            eprintln!("rtpgccbwe attached — adaptive bitrate active (target {bitrate} kbit/s)");
+        } else {
+            eprintln!("ADAPT=1 but rtpgccbwe MISSING — running static");
+        }
+    }
 
     // webrtcbin re-times PTS on receive, so match by RTP timestamp instead — it
     // survives end-to-end. Record the marker packet (end of access unit) on each
@@ -145,21 +192,25 @@ fn main() {
     std::thread::sleep(Duration::from_secs(secs));
     pipeline.set_state(gst::State::Null).unwrap();
 
-    println!("tx_frames={} rx_frames={}", *tx_n.lock().unwrap(), *rx_n.lock().unwrap());
+    println!("tx_frames={} rx_frames={} final_bitrate={}kbit/s",
+        *tx_n.lock().unwrap(), *rx_n.lock().unwrap(), cur_bitrate.load(Ordering::Relaxed));
 
-    let mut v = lats.lock().unwrap().clone();
-    let unmatched = sent.lock().unwrap().len();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
+    let arr = lats.lock().unwrap().clone(); // arrival order
+    let n = arr.len();
     if n == 0 {
-        println!("NO MATCHED FRAMES (unmatched_sent={unmatched})");
+        println!("NO MATCHED FRAMES");
         return;
     }
+    let win = (n / 5).max(1);
+    let mean_of = |s: &[f64]| s.iter().sum::<f64>() / s.len() as f64;
+    let early = mean_of(&arr[..win]);
+    let late = mean_of(&arr[n - win..]);
+    let mut v = arr.clone();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pct = |q: f64| v[(((n - 1) as f64) * q).round() as usize];
-    let mean = v.iter().sum::<f64>() / n as f64;
-    println!("matched_frames={n} unmatched_sent={unmatched}");
+    println!("matched_frames={n}");
     println!(
-        "WebRTC transport latency (ms): min={:.1} p50={:.1} mean={:.1} p90={:.1} p99={:.1} max={:.1}",
-        v[0], pct(0.50), mean, pct(0.90), pct(0.99), v[n - 1]
+        "WebRTC transport latency (ms): p50={:.1} p90={:.1} p99={:.1} max={:.1} | early={:.1} late={:.1} (bufferbloat if late>>early)",
+        pct(0.50), pct(0.90), pct(0.99), v[n - 1], early, late
     );
 }
