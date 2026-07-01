@@ -14,13 +14,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use vantage_protocol::codec;
-use vantage_protocol::signalling::{IceServer, RobotInfo, RobotMsg, ServerMsg};
+use vantage_protocol::signalling::{default_ice, IceServer, RobotInfo, RobotMsg, ServerMsg};
 use vantage_protocol::{RobotId, SessionId};
 use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::{Consumer, RobotMedia};
 use vantage_signalling::ws::CoordinatorWs;
 
-use safety::{SafeState, Watchdog};
+use safety::Watchdog;
 use telemetry::Sampler;
 
 #[tokio::main]
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
 
     // LAN fast path: direct signalling listener + mDNS advertisement, independent of
     // the coordinator so an offline LAN client can still discover and connect.
-    let direct_port = discovery::serve_direct(media.clone(), ice.clone()).await?;
+    let direct_port = discovery::serve_direct(media.clone()).await?;
     let _mdns = match discovery::advertise(&robot_info, direct_port) {
         Ok(daemon) => Some(daemon),
         Err(e) => {
@@ -197,8 +197,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = watchdog_tick.tick() => {
-                for (s, state) in watchdog.tick(std::time::Instant::now()) {
-                    let SafeState::Entered { reason } = state;
+                for (s, reason) in watchdog.tick(std::time::Instant::now()) {
                     // Neutral command held for this session (no actuator in the PoC).
                     tracing::warn!("safe-state entered: {s} ({reason})");
                 }
@@ -240,14 +239,4 @@ async fn fetch_ice(coord: &str) -> Result<Vec<IceServer>> {
         .json::<Vec<IceServer>>()
         .await?;
     Ok(servers)
-}
-
-/// STUN-only ICE for the offline LAN path (host candidates carry a same-LAN link;
-/// no TURN relay is reachable or needed when the coordinator is down).
-fn default_ice() -> Vec<IceServer> {
-    vec![IceServer {
-        urls: vec!["stun:stun.l.google.com:19302".into()],
-        username: None,
-        credential: None,
-    }]
 }

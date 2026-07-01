@@ -27,11 +27,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_env() -> Self {
-        let mut ice = vec![IceServer {
-            urls: vec!["stun:stun.l.google.com:19302".into()],
-            username: None,
-            credential: None,
-        }];
+        let mut ice = vantage_protocol::signalling::default_ice();
         if let Ok(turn_url) = std::env::var("VANTAGE_TURN_URL") {
             ice.push(IceServer {
                 urls: vec![turn_url],

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 use vantage_protocol::codec;
-use vantage_protocol::signalling::{ClientMsg, IceServer, ServerMsg};
+use vantage_protocol::signalling::{default_ice, ClientMsg, IceServer, ServerMsg};
 use vantage_protocol::telemetry::DeviceInfo;
 use vantage_protocol::ControlMsg;
 use vantage_signalling::peer::{Peer, PeerEvent, VideoFrame};
@@ -146,13 +146,4 @@ async fn fetch_ice(coord: &str) -> Result<Vec<IceServer>> {
     let http = coord.replacen("ws", "http", 1);
     let servers = reqwest::get(format!("{http}/ice")).await?.json::<Vec<IceServer>>().await?;
     Ok(servers)
-}
-
-/// STUN-only ICE for the offline LAN path (host candidates carry the same-LAN link).
-fn default_ice() -> Vec<IceServer> {
-    vec![IceServer {
-        urls: vec!["stun:stun.l.google.com:19302".into()],
-        username: None,
-        credential: None,
-    }]
 }

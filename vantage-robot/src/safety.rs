@@ -16,12 +16,6 @@ use vantage_protocol::SessionId;
 /// The client sends a keepalive every 100 ms, so ~5 consecutive losses trip it.
 pub const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The safe-state decision for a session that just went stale this tick.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SafeState {
-    Entered { reason: &'static str },
-}
-
 #[derive(Default)]
 pub struct Watchdog {
     last: HashMap<SessionId, Instant>,
@@ -52,9 +46,10 @@ impl Watchdog {
         }
     }
 
-    /// Sessions that newly went stale this tick, driven to safe state (idempotent:
-    /// a session that stays stale is reported only on the tick it first trips).
-    pub fn tick(&mut self, now: Instant) -> Vec<(SessionId, SafeState)> {
+    /// Sessions that newly went stale this tick, each with a safe-state reason
+    /// (idempotent: a session that stays stale is reported only on the tick it
+    /// first trips).
+    pub fn tick(&mut self, now: Instant) -> Vec<(SessionId, &'static str)> {
         let mut newly_stale: Vec<SessionId> = Vec::new();
         for (s, &t) in &self.last {
             let already_tripped = *self.tripped.get(s).unwrap_or(&false);
@@ -65,10 +60,7 @@ impl Watchdog {
         for s in &newly_stale {
             self.tripped.insert(s.clone(), true);
         }
-        newly_stale
-            .into_iter()
-            .map(|s| (s, SafeState::Entered { reason: "control stale" }))
-            .collect()
+        newly_stale.into_iter().map(|s| (s, "control stale")).collect()
     }
 
     /// Whether commands for this session may currently be acted on. False for an
@@ -102,7 +94,7 @@ mod tests {
         let mut w = Watchdog::default();
         w.arm(sess(), t0);
         let trips = w.tick(t0 + Duration::from_millis(600));
-        assert_eq!(trips, vec![(sess(), SafeState::Entered { reason: "control stale" })]);
+        assert_eq!(trips, vec![(sess(), "control stale")]);
         assert!(!w.is_live(&sess()));
         // Still stale on the next tick, but already reported — no duplicate.
         assert!(w.tick(t0 + Duration::from_millis(700)).is_empty());

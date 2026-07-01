@@ -11,18 +11,18 @@ use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::net::TcpListener;
 use vantage_protocol::discovery::{advert_txt, MDNS_SERVICE_TYPE};
-use vantage_protocol::signalling::{ClientMsg, IceServer, RobotInfo, ServerMsg};
+use vantage_protocol::signalling::{ClientMsg, RobotInfo, ServerMsg};
 use vantage_protocol::SessionId;
 use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::RobotMedia;
 use vantage_signalling::ws::PeerWs;
 
-use crate::safety::{SafeState, Watchdog};
+use crate::safety::Watchdog;
 use crate::telemetry::Sampler;
 
 /// Bind the direct signalling listener on an ephemeral port and spawn its accept
 /// loop. Returns the bound port for the mDNS SRV record.
-pub async fn serve_direct(media: Arc<RobotMedia>, ice: Vec<IceServer>) -> Result<u16> {
+pub async fn serve_direct(media: Arc<RobotMedia>) -> Result<u16> {
     let listener = TcpListener::bind("0.0.0.0:0")
         .await
         .context("bind direct signalling listener")?;
@@ -32,10 +32,9 @@ pub async fn serve_direct(media: Arc<RobotMedia>, ice: Vec<IceServer>) -> Result
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     let media = media.clone();
-                    let ice = ice.clone();
                     tokio::spawn(async move {
                         tracing::info!("direct client connecting from {addr}");
-                        if let Err(e) = handle_direct_client(media, ice, stream).await {
+                        if let Err(e) = handle_direct_client(media, stream).await {
                             tracing::warn!("direct client {addr} ended: {e}");
                         }
                     });
@@ -77,7 +76,6 @@ pub fn advertise(info: &RobotInfo, port: u16) -> Result<ServiceDaemon> {
 /// watchdog. Mirrors the coordinator path but scoped to a single peer.
 async fn handle_direct_client(
     media: Arc<RobotMedia>,
-    _ice: Vec<IceServer>,
     stream: tokio::net::TcpStream,
 ) -> Result<()> {
     let ws = PeerWs::accept(stream).await?;
@@ -126,8 +124,7 @@ async fn handle_direct_client(
                 }
             }
             _ = watchdog_tick.tick() => {
-                for (s, state) in watchdog.tick(Instant::now()) {
-                    let SafeState::Entered { reason } = state;
+                for (s, reason) in watchdog.tick(Instant::now()) {
                     tracing::warn!("safe-state entered: {s} ({reason})");
                 }
             }

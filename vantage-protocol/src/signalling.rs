@@ -21,6 +21,16 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// STUN-only ICE default: the public STUN server, no TURN. Host candidates carry a
+/// same-LAN link, and this is the base the coordinator extends with TURN when set.
+pub fn default_ice() -> Vec<IceServer> {
+    vec![IceServer {
+        urls: vec!["stun:stun.l.google.com:19302".into()],
+        username: None,
+        credential: None,
+    }]
+}
+
 /// The SDP/ICE payloads that the coordinator relays verbatim between peers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

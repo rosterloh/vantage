@@ -248,7 +248,7 @@ impl RobotMedia {
                 "create-data-channel",
                 &[
                     vantage_protocol::CONTROL_LABEL.to_value(),
-                    crate::control::control_dc_options().to_value(),
+                    control_dc_options().to_value(),
                 ],
             )
             .context("create-data-channel(control) returned no value")?
@@ -281,7 +281,6 @@ impl RobotMedia {
             queue,
             rtptee_pad,
             data_channel: std::sync::Mutex::new(Some(dc)),
-            control_channel: std::sync::Mutex::new(Some(control_dc)),
         })
     }
 
@@ -325,10 +324,16 @@ pub struct Consumer {
     queue: gst::Element,
     rtptee_pad: gst::Pad,
     data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
-    /// Operator→robot control channel; held to keep it alive. Inbound teleop is
-    /// delivered via `PeerEvent::Control` by `wire_control_channel`, not read here.
-    #[allow(dead_code)]
-    control_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
+}
+
+/// Options for the `control` data channel: unreliable + unordered so a lost or late
+/// teleop command never head-of-line-blocks the next (latest-command-wins). Safety
+/// comes from the robot's disconnect watchdog, not retransmission.
+fn control_dc_options() -> gst::Structure {
+    gst::Structure::builder("config")
+        .field("ordered", false)
+        .field("max-retransmits", 0i32)
+        .build()
 }
 
 /// Forward inbound `control`-channel bytes as `PeerEvent::Control`. The robot both

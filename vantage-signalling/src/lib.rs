@@ -1,4 +1,3 @@
-pub mod control;
 pub mod decoder;
 pub mod encoder;
 pub mod peer;
