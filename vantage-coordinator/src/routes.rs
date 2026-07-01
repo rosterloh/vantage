@@ -69,6 +69,7 @@ async fn client_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> 
     ws.on_upgrade(move |socket| crate::routes::handle_client(socket, state))
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
     let (mut tx_ws, mut rx_ws) = socket.split();
     let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();
@@ -129,6 +130,7 @@ async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
     }
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
     let (mut tx_ws, mut rx_ws) = socket.split();
     let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();

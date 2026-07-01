@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "vantage-protocol",
     "vantage-signalling",
+    "vantage-observability",
     "vantage-coordinator",
     "vantage-robot",
     "vantage-client",
@@ -21,3 +22,12 @@ anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# OpenTelemetry (logs, metrics, traces) exported over OTLP/gRPC. Versions must
+# move together — tracing-opentelemetry 0.33 pins the opentelemetry 0.32 line.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "logs"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs"] }
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-semantic-conventions = "0.32"
+tracing-opentelemetry = "0.33"

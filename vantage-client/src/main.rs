@@ -28,9 +28,7 @@ fn spawn_session(sink: Arc<dyn UiSink>) {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let _otel = vantage_observability::init("vantage-client");
 
     // Headless mode for display-less verification (CI / sandboxes).
     if std::env::var("VANTAGE_HEADLESS").is_ok_and(|v| v != "0" && !v.is_empty()) {
