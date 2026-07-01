@@ -15,6 +15,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sysinfo = "0.33"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+mdns-sd.workspace = true
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 # ROS 2 bridge (off by default). r2r generates its rcl + message bindings at
 # build time from the sourced ROS 2 environment (no colcon/ament, no cargo

@@ -1,3 +1,4 @@
+mod discovery;
 mod safety;
 mod telemetry;
 
@@ -32,22 +33,21 @@ async fn main() -> Result<()> {
         std::env::var("VANTAGE_COORDINATOR").unwrap_or_else(|_| "ws://localhost:8080".into());
     let id = RobotId(std::env::var("VANTAGE_ROBOT_ID").unwrap_or_else(|_| "robot-1".into()));
 
-    let ice = fetch_ice(&coord).await?;
-
-    let ws = CoordinatorWs::connect(&format!("{coord}/ws/robot")).await?;
-    let (mut tx, mut rx) = ws.split();
-    tx.send(&RobotMsg::Register(RobotInfo {
+    // ICE is fetched from the coordinator, but on the offline LAN path the coordinator
+    // is unreachable — fall back to STUN-only (host candidates carry the LAN).
+    let ice = fetch_ice(&coord).await.unwrap_or_else(|e| {
+        tracing::warn!("ICE fetch failed ({e}) — using STUN-only defaults (LAN/direct path)");
+        default_ice()
+    });
+    let robot_info = RobotInfo {
         id: id.clone(),
         name: std::env::var("VANTAGE_ROBOT_NAME").unwrap_or_else(|_| "Atlas".into()),
         capabilities: vec!["telemetry".into()],
-    }))
-    .await?;
-    tracing::info!("registered as {id}");
+    };
 
     // ONE shared capture/encode engine: camera → tee → encode-once → rtptee fan-out,
     // plus the raw pre-encode branch. Built (and PLAYed) once; encoder runs once.
     let media = Arc::new(RobotMedia::new(&ice)?);
-    let mut consumers: HashMap<SessionId, Consumer> = HashMap::new();
     // Sessions whose telemetry data channel is open.
     let mut dc_open: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
     // Teleop disconnect failsafe: no command is acted on unless its session is live.
@@ -105,6 +105,32 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // LAN fast path: direct signalling listener + mDNS advertisement, independent of
+    // the coordinator so an offline LAN client can still discover and connect.
+    let direct_port = discovery::serve_direct(media.clone(), ice.clone()).await?;
+    let _mdns = match discovery::advertise(&robot_info, direct_port) {
+        Ok(daemon) => Some(daemon),
+        Err(e) => {
+            tracing::warn!("mDNS advertise failed: {e}");
+            None
+        }
+    };
+
+    // Coordinator path (primary). If unreachable, keep running to serve LAN clients.
+    let ws = match CoordinatorWs::connect(&format!("{coord}/ws/robot")).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!(
+                "coordinator unreachable ({e}) — serving LAN clients via mDNS/direct only"
+            );
+            return std::future::pending::<Result<()>>().await;
+        }
+    };
+    let (mut tx, mut rx) = ws.split();
+    tx.send(&RobotMsg::Register(robot_info.clone())).await?;
+    tracing::info!("registered as {id}");
+    let mut consumers: HashMap<SessionId, Consumer> = HashMap::new();
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
@@ -214,4 +240,14 @@ async fn fetch_ice(coord: &str) -> Result<Vec<IceServer>> {
         .json::<Vec<IceServer>>()
         .await?;
     Ok(servers)
+}
+
+/// STUN-only ICE for the offline LAN path (host candidates carry a same-LAN link;
+/// no TURN relay is reachable or needed when the coordinator is down).
+fn default_ice() -> Vec<IceServer> {
+    vec![IceServer {
+        urls: vec!["stun:stun.l.google.com:19302".into()],
+        username: None,
+        credential: None,
+    }]
 }

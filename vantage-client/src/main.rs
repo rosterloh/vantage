@@ -1,3 +1,4 @@
+mod discovery;
 mod session;
 mod ui;
 
