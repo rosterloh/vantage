@@ -1,7 +1,9 @@
 use anyhow::Result;
+use tokio::sync::mpsc;
 use vantage_protocol::codec;
 use vantage_protocol::signalling::{ClientMsg, IceServer, ServerMsg};
 use vantage_protocol::telemetry::DeviceInfo;
+use vantage_protocol::ControlMsg;
 use vantage_signalling::peer::{Peer, PeerEvent, VideoFrame};
 use vantage_signalling::ws::CoordinatorWs;
 
@@ -15,7 +17,11 @@ pub trait UiSink: Send + Sync + 'static {
     fn status(&self, text: &str);
 }
 
-pub async fn run_session(coord: String, ui: Arc<dyn UiSink>) -> Result<()> {
+pub async fn run_session(
+    coord: String,
+    ui: Arc<dyn UiSink>,
+    mut control_rx: mpsc::UnboundedReceiver<ControlMsg>,
+) -> Result<()> {
     let mut ws = CoordinatorWs::connect(&format!("{coord}/ws/client")).await?;
 
     ws.send(&ClientMsg::ListRobots).await?;
@@ -46,6 +52,7 @@ pub async fn run_session(coord: String, ui: Arc<dyn UiSink>) -> Result<()> {
     }
 
     let (mut tx, mut rx) = ws.split();
+    let mut control_closed = false;
     loop {
         tokio::select! {
             msg = rx.recv::<ServerMsg>() => {
@@ -67,7 +74,16 @@ pub async fn run_session(coord: String, ui: Arc<dyn UiSink>) -> Result<()> {
                             ui.telemetry(&info);
                         }
                     }
+                    // Control is client->robot only; nothing arrives here.
+                    Some(PeerEvent::Control(_)) => {}
                     None => {}
+                }
+            }
+            // Operator input (keyboard / headless stub) -> robot control channel.
+            cmd = control_rx.recv(), if !control_closed => {
+                match cmd {
+                    Some(msg) => peer.send_control(&msg)?,
+                    None => control_closed = true,
                 }
             }
         }

@@ -141,7 +141,15 @@ async fn main() -> Result<()> {
                         tracing::info!("data channel open: {s}");
                         dc_open.insert(s);
                     }
-                    Some((_, PeerEvent::DataMessage(_))) => { /* reserved: future control channel */ }
+                    Some((_, PeerEvent::DataMessage(_))) => { /* telemetry is robot->client only */ }
+                    Some((s, PeerEvent::Control(bytes))) => {
+                        // Task 2: log receipt only. Task 3 gates this behind the watchdog
+                        // before any command is treated as live.
+                        match codec::decode::<vantage_protocol::ControlMsg>(&bytes) {
+                            Ok(msg) => tracing::debug!("control from {s}: {msg:?}"),
+                            Err(e) => tracing::warn!("bad control message from {s}: {e}"),
+                        }
+                    }
                     None => {}
                 }
             }

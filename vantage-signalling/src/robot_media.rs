@@ -239,6 +239,23 @@ impl RobotMedia {
             .get::<gst_webrtc::WebRTCDataChannel>()
             .context("create-data-channel returned null")?;
         wire_data_channel(&dc, &tx);
+
+        // Reserve the operator→robot control channel in the SAME negotiation (day-one
+        // bidirectional, no renegotiation). Unreliable/unordered (latest-command-wins);
+        // inbound teleop arrives as PeerEvent::Control and is gated by the watchdog.
+        let control_dc = webrtcbin
+            .emit_by_name_with_values(
+                "create-data-channel",
+                &[
+                    vantage_protocol::CONTROL_LABEL.to_value(),
+                    crate::control::control_dc_options().to_value(),
+                ],
+            )
+            .context("create-data-channel(control) returned no value")?
+            .get::<gst_webrtc::WebRTCDataChannel>()
+            .context("create-data-channel(control) returned null")?;
+        wire_control_channel(&control_dc, &tx);
+
         wire_on_negotiation_needed(&webrtcbin, &tx);
 
         // Force a keyframe so the new viewer gets an IDR immediately instead of
@@ -264,6 +281,7 @@ impl RobotMedia {
             queue,
             rtptee_pad,
             data_channel: std::sync::Mutex::new(Some(dc)),
+            control_channel: std::sync::Mutex::new(Some(control_dc)),
         })
     }
 
@@ -307,6 +325,25 @@ pub struct Consumer {
     queue: gst::Element,
     rtptee_pad: gst::Pad,
     data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
+    /// Operator→robot control channel; held to keep it alive. Inbound teleop is
+    /// delivered via `PeerEvent::Control` by `wire_control_channel`, not read here.
+    #[allow(dead_code)]
+    control_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
+}
+
+/// Forward inbound `control`-channel bytes as `PeerEvent::Control`. The robot both
+/// creates and receives on this channel (DCEP channels are bidirectional).
+fn wire_control_channel(
+    dc: &gst_webrtc::WebRTCDataChannel,
+    tx: &mpsc::UnboundedSender<PeerEvent>,
+) {
+    let tx = tx.clone();
+    dc.connect("on-message-data", false, move |vals| {
+        if let Ok(bytes) = vals[1].get::<glib::Bytes>() {
+            let _ = tx.send(PeerEvent::Control(bytes.to_vec()));
+        }
+        None
+    });
 }
 
 impl Consumer {
