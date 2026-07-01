@@ -1,3 +1,4 @@
+mod safety;
 mod telemetry;
 
 #[allow(dead_code)] // used by ros/mod.rs under --features ros; exercised by unit tests otherwise
@@ -18,6 +19,7 @@ use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::{Consumer, RobotMedia};
 use vantage_signalling::ws::CoordinatorWs;
 
+use safety::{SafeState, Watchdog};
 use telemetry::Sampler;
 
 #[tokio::main]
@@ -48,6 +50,8 @@ async fn main() -> Result<()> {
     let mut consumers: HashMap<SessionId, Consumer> = HashMap::new();
     // Sessions whose telemetry data channel is open.
     let mut dc_open: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+    // Teleop disconnect failsafe: no command is acted on unless its session is live.
+    let mut watchdog = Watchdog::default();
     let mut sampler = Sampler::new();
 
     // Shared, session-tagged event channel: every Consumer forwards its PeerEvents
@@ -104,6 +108,9 @@ async fn main() -> Result<()> {
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
+    // Poll the failsafe often relative to CONTROL_TIMEOUT (500ms) so a stale session
+    // trips promptly.
+    let mut watchdog_tick = tokio::time::interval(Duration::from_millis(100));
 
     loop {
         tokio::select! {
@@ -114,6 +121,7 @@ async fn main() -> Result<()> {
                     Some(ServerMsg::ClientConnected { session: s }) => {
                         tracing::info!("client connected: {s}");
                         let c = media.add_consumer(s.clone(), events_tx.clone())?;
+                        watchdog.arm(s.clone(), std::time::Instant::now());
                         consumers.insert(s, c);
                     }
                     Some(ServerMsg::ClientDisconnected { session: s }) => {
@@ -121,6 +129,8 @@ async fn main() -> Result<()> {
                         if let Some(c) = consumers.remove(&s) {
                             media.remove_consumer(c);
                         }
+                        watchdog.disarm(&s);
+                        tracing::warn!("safe-state entered: {s} (disconnect)");
                         dc_open.remove(&s);
                     }
                     Some(ServerMsg::Signal { from: Some(s), signal }) => {
@@ -143,14 +153,28 @@ async fn main() -> Result<()> {
                     }
                     Some((_, PeerEvent::DataMessage(_))) => { /* telemetry is robot->client only */ }
                     Some((s, PeerEvent::Control(bytes))) => {
-                        // Task 2: log receipt only. Task 3 gates this behind the watchdog
-                        // before any command is treated as live.
                         match codec::decode::<vantage_protocol::ControlMsg>(&bytes) {
-                            Ok(msg) => tracing::debug!("control from {s}: {msg:?}"),
+                            Ok(msg) => {
+                                // A fresh command re-arms the watchdog (and clears any
+                                // prior staleness trip — a momentary stall self-heals).
+                                watchdog.feed(&s, std::time::Instant::now());
+                                // SAFETY GATE: only act on the command while the session
+                                // is live; otherwise hold the neutral command.
+                                if watchdog.is_live(&s) {
+                                    act_on_control(&s, msg);
+                                }
+                            }
                             Err(e) => tracing::warn!("bad control message from {s}: {e}"),
                         }
                     }
                     None => {}
+                }
+            }
+            _ = watchdog_tick.tick() => {
+                for (s, state) in watchdog.tick(std::time::Instant::now()) {
+                    let SafeState::Entered { reason } = state;
+                    // Neutral command held for this session (no actuator in the PoC).
+                    tracing::warn!("safe-state entered: {s} ({reason})");
                 }
             }
             _ = heartbeat.tick() => {
@@ -168,6 +192,19 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Act on a live teleop command. The PoC has no actuator, so "acting" means logging
+/// the command (a real robot would drive its motion layer here). KeepAlive carries no
+/// motion — it only re-armed the watchdog at the call site.
+fn act_on_control(session: &SessionId, msg: vantage_protocol::ControlMsg) {
+    use vantage_protocol::ControlMsg;
+    match msg {
+        ControlMsg::Move { linear, angular } => {
+            tracing::info!("acting on control {session}: move linear={linear} angular={angular}");
+        }
+        ControlMsg::KeepAlive => {}
+    }
 }
 
 async fn fetch_ice(coord: &str) -> Result<Vec<IceServer>> {
