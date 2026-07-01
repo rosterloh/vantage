@@ -42,7 +42,7 @@ processors:
     spike_limit_percentage: 25
   # Attach host/env resource attributes without overwriting the service.name the
   # apps already set.
-  resourcedetection:
+  resource_detection:
     detectors: [env, system]
     override: false
   batch:
@@ -60,13 +60,13 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, resourcedetection, batch]
+      processors: [memory_limiter, resource_detection, batch]
       exporters: [otlphttp/grafanacloud]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, resourcedetection, batch]
+      processors: [memory_limiter, resource_detection, batch]
       exporters: [otlphttp/grafanacloud]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, resourcedetection, batch]
+      processors: [memory_limiter, resource_detection, batch]
       exporters: [otlphttp/grafanacloud]
