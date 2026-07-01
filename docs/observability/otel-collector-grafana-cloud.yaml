@@ -1,0 +1,72 @@
+# OpenTelemetry Collector config: receive OTLP from the Vantage binaries and
+# forward logs, metrics, and traces to Grafana Cloud's unified OTLP gateway.
+#
+# 1. Point the Vantage apps at this collector (its OTLP gRPC receiver):
+#      OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+#
+# 2. Set these before starting the collector. Get them from your Grafana Cloud
+#    stack's "OpenTelemetry" / "OTLP" page — create a Cloud Access Policy token
+#    with the metrics, logs, and traces *write* scopes:
+#      GRAFANA_CLOUD_OTLP_ENDPOINT   e.g. https://otlp-gateway-prod-eu-west-2.grafana.net/otlp
+#      GRAFANA_CLOUD_INSTANCE_ID     numeric instance / user ID
+#      GRAFANA_CLOUD_API_TOKEN       Cloud Access Policy token
+#
+# 3. Run the collector (contrib distribution — it bundles the basicauth
+#    extension used below):
+#      docker run --rm -p 4317:4317 -p 4318:4318 \
+#        -e GRAFANA_CLOUD_OTLP_ENDPOINT -e GRAFANA_CLOUD_INSTANCE_ID -e GRAFANA_CLOUD_API_TOKEN \
+#        -v "$PWD/otel-collector-grafana-cloud.yaml:/etc/otelcol-contrib/config.yaml" \
+#        otel/opentelemetry-collector-contrib:latest
+
+extensions:
+  # Turns instance-id + token into the `Authorization: Basic ...` header that the
+  # Grafana Cloud OTLP gateway expects.
+  basicauth/grafanacloud:
+    client_auth:
+      username: "${env:GRAFANA_CLOUD_INSTANCE_ID}"
+      password: "${env:GRAFANA_CLOUD_API_TOKEN}"
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Guard against unbounded memory use under a backlog; drops data before OOM.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  # Attach host/env resource attributes without overwriting the service.name the
+  # apps already set.
+  resourcedetection:
+    detectors: [env, system]
+    override: false
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  otlphttp/grafanacloud:
+    endpoint: "${env:GRAFANA_CLOUD_OTLP_ENDPOINT}"
+    auth:
+      authenticator: basicauth/grafanacloud
+
+service:
+  extensions: [basicauth/grafanacloud]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/grafanacloud]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/grafanacloud]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/grafanacloud]
