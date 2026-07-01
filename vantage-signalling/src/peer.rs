@@ -7,7 +7,9 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use vantage_protocol::control::{ControlMsg, CONTROL_LABEL};
 use vantage_protocol::signalling::{IceServer, Signal};
 
 #[derive(Debug)]
@@ -17,8 +19,10 @@ pub enum PeerEvent {
     /// Signal::Ice to forward.
     LocalIce(Signal),
     DataChannelOpen,
-    /// Bytes received on the data channel.
+    /// Bytes received on the telemetry data channel.
     DataMessage(Vec<u8>),
+    /// Bytes received on the `control` data channel (operator→robot teleop).
+    Control(Vec<u8>),
 }
 
 /// One decoded RGBA video frame handed to the UI.
@@ -43,6 +47,9 @@ pub struct Peer {
     events_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerEvent>>,
     events_tx: mpsc::UnboundedSender<PeerEvent>,
     data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
+    /// The operator→robot `control` channel, populated when the robot's control DC
+    /// arrives via `on-data-channel` (shared with that closure, hence `Arc`).
+    control_channel: Arc<std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>>,
     frames_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<VideoFrame>>,
     frames_tx: mpsc::UnboundedSender<VideoFrame>,
 }
@@ -74,6 +81,7 @@ impl Peer {
             events_rx: tokio::sync::Mutex::new(rx),
             events_tx: tx.clone(),
             data_channel: std::sync::Mutex::new(None),
+            control_channel: Arc::new(std::sync::Mutex::new(None)),
             frames_rx: tokio::sync::Mutex::new(frames_rx),
             frames_tx: frames_tx.clone(),
         };
@@ -83,9 +91,16 @@ impl Peer {
         peer.pipeline.set_state(gst::State::Playing)?;
 
         let tx2 = tx.clone();
+        let control_slot = peer.control_channel.clone();
         peer.webrtcbin.connect("on-data-channel", false, move |vals| {
             let dc = vals[1].get::<gst_webrtc::WebRTCDataChannel>().unwrap();
-            wire_data_channel(&dc, &tx2);
+            // The robot creates two channels on one SCTP transport (no renegotiation);
+            // route by label — `control` is our operator→robot send channel.
+            if dc.property::<String>("label") == CONTROL_LABEL {
+                *control_slot.lock().unwrap() = Some(dc);
+            } else {
+                wire_data_channel(&dc, &tx2);
+            }
             None
         });
         wire_video_receiver(&peer.pipeline, &peer.webrtcbin, &peer.frames_tx);
@@ -157,6 +172,19 @@ impl Peer {
         if let Some(dc) = self.data_channel.lock().unwrap().as_ref() {
             let glib_bytes = glib::Bytes::from(bytes);
             dc.emit_by_name::<()>("send-data", &[&glib_bytes]);
+        }
+        Ok(())
+    }
+
+    /// Send a teleop command on the operator→robot `control` channel. No-op (with a
+    /// debug log) until the control channel has arrived and opened.
+    pub fn send_control(&self, msg: &ControlMsg) -> Result<()> {
+        if let Some(dc) = self.control_channel.lock().unwrap().as_ref() {
+            let bytes = vantage_protocol::codec::encode(msg)?;
+            let glib_bytes = glib::Bytes::from(&bytes);
+            dc.emit_by_name::<()>("send-data", &[&glib_bytes]);
+        } else {
+            tracing::debug!("control channel not open yet; dropping {msg:?}");
         }
         Ok(())
     }

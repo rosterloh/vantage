@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use vantage_protocol::signalling::{ClientMsg, IceServer, RobotMsg, ServerMsg};
-use vantage_protocol::{RobotId, SessionId};
+use vantage_protocol::{FleetStats, RobotId, SessionId};
 
 use crate::registry::Registry;
 use crate::sessions::Sessions;
@@ -27,11 +27,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_env() -> Self {
-        let mut ice = vec![IceServer {
-            urls: vec!["stun:stun.l.google.com:19302".into()],
-            username: None,
-            credential: None,
-        }];
+        let mut ice = vantage_protocol::signalling::default_ice();
         if let Ok(turn_url) = std::env::var("VANTAGE_TURN_URL") {
             ice.push(IceServer {
                 urls: vec![turn_url],
@@ -52,6 +48,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/ice", get(ice_servers))
+        .route("/stats", get(stats))
         .route("/ws/robot", get(robot_ws))
         .route("/ws/client", get(client_ws))
         .with_state(state)
@@ -59,6 +56,18 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn ice_servers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.ice_servers.clone())
+}
+
+/// Session-derived fleet statistics. Prune first so the provider count is accurate
+/// between the background pruner's ticks; the consumer count reconciles on socket drop.
+async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let providers_online = {
+        let mut reg = state.registry.lock().await;
+        reg.prune(std::time::Instant::now());
+        reg.len()
+    };
+    let consumers_connected = state.sessions.lock().await.consumer_count();
+    Json(FleetStats { providers_online, consumers_connected })
 }
 
 async fn robot_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
