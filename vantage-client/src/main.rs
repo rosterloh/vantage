@@ -64,9 +64,7 @@ async fn headless_control(control_tx: mpsc::UnboundedSender<ControlMsg>) {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let _otel = vantage_observability::init("vantage-client");
 
     let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlMsg>();
 

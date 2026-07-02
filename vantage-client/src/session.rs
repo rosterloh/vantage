@@ -20,6 +20,7 @@ pub trait UiSink: Send + Sync + 'static {
     fn status(&self, text: &str);
 }
 
+#[tracing::instrument(skip(ui, control_rx))]
 pub async fn run_session(
     coord: String,
     ui: Arc<dyn UiSink>,
@@ -92,12 +93,19 @@ async fn run_answer_loop(
     ui: Arc<dyn UiSink>,
     mut control_rx: mpsc::UnboundedReceiver<ControlMsg>,
 ) -> Result<()> {
+    // Metric instruments — no-ops until a global meter provider is installed.
+    let meter = vantage_observability::opentelemetry::global::meter("vantage-client");
+    let frames_rx = meter.u64_counter("vantage.client.frames_received").build();
+    let telemetry_rx = meter.u64_counter("vantage.client.telemetry_received").build();
+
     // Frame pump: decoded frames -> UI.
     {
         let peer = peer.clone();
         let ui = ui.clone();
+        let frames_rx = frames_rx.clone();
         tokio::spawn(async move {
             while let Some(frame) = peer.recv_frame().await {
+                frames_rx.add(1, &[]);
                 ui.frame(frame);
             }
         });
@@ -122,6 +130,7 @@ async fn run_answer_loop(
                     Some(PeerEvent::DataChannelOpen) => ui.status("connected"),
                     Some(PeerEvent::DataMessage(bytes)) => {
                         if let Ok(info) = codec::decode::<DeviceInfo>(&bytes) {
+                            telemetry_rx.add(1, &[]);
                             ui.telemetry(&info);
                         }
                     }

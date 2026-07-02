@@ -18,6 +18,7 @@ implementation plan.
 |----------------------|------|----------------|
 | `vantage-protocol`   | lib  | Shared `serde` types: signalling messages, telemetry (`DeviceInfo`), ICE config, and a one-place codec wrapper (JSON now, `bincode` later). |
 | `vantage-signalling` | lib  | Drives a `webrtcbin` peer and the coordinator WebSocket client; shared by robot and client. |
+| `vantage-observability` | lib | Shared logging + OpenTelemetry (logs/metrics/traces) init; OTLP export when configured, stderr otherwise. |
 | `vantage-coordinator`| bin  | Rendezvous service (axum): robot registration + heartbeat, client discovery, SDP/ICE relay, fleet stats, ICE-server provisioning. |
 | `vantage-robot`      | bin  | GStreamer pipeline, telemetry producer; streams to clients over WebRTC. |
 | `vantage-client`     | bin  | Operator console: discovers robots, connects, shows live stream + telemetry. |
@@ -102,3 +103,33 @@ RUST_LOG=info VANTAGE_COORDINATOR=ws://localhost:8080 cargo run -p vantage-clien
 | `VANTAGE_TURN_URL`  | _(unset)_        | TURN server URL; when set, added to the ICE config handed to peers. |
 | `VANTAGE_TURN_USER` | _(unset)_        | TURN username (static credential for the PoC). |
 | `VANTAGE_TURN_PASS` | _(unset)_        | TURN credential. |
+
+## Observability (OpenTelemetry → Grafana)
+
+All three binaries emit structured **logs**, **metrics**, and **traces** through
+`vantage-observability`. Export is opt-in: set `OTEL_EXPORTER_OTLP_ENDPOINT` to an
+OTLP/gRPC collector and the process ships all three signals there; leave it unset
+and behaviour is unchanged (plain `RUST_LOG` logging on stderr, no exporter).
+
+```bash
+# Export to a local collector / Grafana Alloy on the default OTLP gRPC port.
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+RUST_LOG=info VANTAGE_COORDINATOR=ws://localhost:8080 cargo run -p vantage-robot
+```
+
+Point `OTEL_EXPORTER_OTLP_ENDPOINT` at Grafana Alloy, the OpenTelemetry Collector,
+or a Grafana Cloud OTLP endpoint — from there traces land in Tempo, logs in Loki,
+and metrics in Prometheus/Mimir. Standard OTLP variables apply:
+
+| Variable                      | Purpose |
+|-------------------------------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/gRPC endpoint; **presence enables export** (e.g. `http://localhost:4317`). |
+| `OTEL_EXPORTER_OTLP_HEADERS`  | Extra headers, e.g. Grafana Cloud `Authorization=Basic%20<base64>`. |
+| `OTEL_SERVICE_NAME`           | Override the `service.name` (defaults to `vantage-<binary>`). |
+
+Emitted metrics: `vantage.robot.{cpu_percent,mem_used_mb,mem_total_mb,uptime_s,temperature_celsius,frames_published}`,
+`vantage.coordinator.{robots_online,sessions_active}`,
+`vantage.client.{frames_received,telemetry_received}`.
+
+For a ready-to-run Grafana Cloud setup — an OpenTelemetry Collector config and an
+importable dashboard — see **[docs/observability/](docs/observability/)**.

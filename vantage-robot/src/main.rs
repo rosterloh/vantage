@@ -1,4 +1,5 @@
 mod discovery;
+mod metrics;
 mod safety;
 mod telemetry;
 
@@ -20,14 +21,13 @@ use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::{Consumer, RobotMedia};
 use vantage_signalling::ws::CoordinatorWs;
 
+use metrics::RobotMetrics;
 use safety::Watchdog;
 use telemetry::Sampler;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let _otel = vantage_observability::init("vantage-robot");
 
     let coord =
         std::env::var("VANTAGE_COORDINATOR").unwrap_or_else(|_| "ws://localhost:8080".into());
@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
     // Teleop disconnect failsafe: no command is acted on unless its session is live.
     let mut watchdog = Watchdog::default();
     let mut sampler = Sampler::new();
+    let metrics = RobotMetrics::new();
 
     // Shared, session-tagged event channel: every Consumer forwards its PeerEvents
     // here so the single loop below selects over all consumers at once.
@@ -71,10 +72,12 @@ async fn main() -> Result<()> {
     {
         let media_raw = media.clone();
         let bridge = ros_bridge.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
             let mut n: u64 = 0;
             while let Some(frame) = media_raw.recv_raw_frame().await {
                 n += 1;
+                metrics.frame_published();
                 let (w, h) = (frame.width, frame.height);
                 match bridge.publish(frame) {
                     Ok(()) => {
@@ -90,10 +93,12 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "ros"))]
     {
         let media_raw = media.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
             let mut n: u64 = 0;
             while let Some(frame) = media_raw.recv_raw_frame().await {
                 n += 1;
+                metrics.frame_published();
                 if n == 1 || n % 30 == 0 {
                     tracing::info!(
                         "raw frame {}x{} {} (#{n})",
@@ -207,6 +212,7 @@ async fn main() -> Result<()> {
             }
             _ = telemetry_tick.tick() => {
                 let info = sampler.sample();
+                metrics.record_device(&info);
                 let bytes = codec::encode(&info)?;
                 for (s, c) in &consumers {
                     if dc_open.contains(s) {

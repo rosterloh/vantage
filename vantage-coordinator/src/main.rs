@@ -12,20 +12,28 @@ async fn main() -> anyhow::Result<()> {
     // file is fine — real environment still wins for anything not set here.
     dotenvy::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let _otel = vantage_observability::init("vantage-coordinator");
 
     let state = Arc::new(AppState::from_env());
 
-    // Background pruner so stale robots expire even with no traffic.
+    // Background pruner so stale robots expire even with no traffic. Doubles as
+    // the sampling point for fleet-size gauges (no-ops until OTLP is configured).
     {
         let state = state.clone();
+        let meter = vantage_observability::opentelemetry::global::meter("vantage-coordinator");
+        let robots = meter.u64_gauge("vantage.coordinator.robots_online").build();
+        let sessions = meter.u64_gauge("vantage.coordinator.sessions_active").build();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                state.registry.lock().await.prune(std::time::Instant::now());
+                let live = {
+                    let mut reg = state.registry.lock().await;
+                    reg.prune(std::time::Instant::now());
+                    reg.len() as u64
+                };
+                robots.record(live, &[]);
+                sessions.record(state.sessions.lock().await.consumer_count() as u64, &[]);
             }
         });
     }
