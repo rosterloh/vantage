@@ -18,7 +18,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # GStreamer dev libraries for the vantage-signalling WebRTC pipeline.
       # The `ros` feature (r2r) needs a full ROS 2 install and is left off here.
