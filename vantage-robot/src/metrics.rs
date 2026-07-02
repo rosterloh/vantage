@@ -22,9 +22,18 @@ impl RobotMetrics {
     pub fn new() -> Self {
         let m = global::meter("vantage-robot");
         Self {
-            cpu_percent: m.f64_gauge("vantage.robot.cpu_percent").with_unit("percent").build(),
-            mem_used_mb: m.u64_gauge("vantage.robot.mem_used_mb").with_unit("MB").build(),
-            mem_total_mb: m.u64_gauge("vantage.robot.mem_total_mb").with_unit("MB").build(),
+            cpu_percent: m
+                .f64_gauge("vantage.robot.cpu_percent")
+                .with_unit("percent")
+                .build(),
+            mem_used_mb: m
+                .u64_gauge("vantage.robot.mem_used_mb")
+                .with_unit("MB")
+                .build(),
+            mem_total_mb: m
+                .u64_gauge("vantage.robot.mem_total_mb")
+                .with_unit("MB")
+                .build(),
             uptime_s: m.u64_gauge("vantage.robot.uptime_s").with_unit("s").build(),
             temperature: m
                 .f64_gauge("vantage.robot.temperature_celsius")
@@ -44,7 +53,10 @@ impl RobotMetrics {
         self.mem_total_mb.record(info.mem_total_mb, &[]);
         self.uptime_s.record(info.uptime_s, &[]);
         for t in &info.temps {
-            self.temperature.record(t.celsius as f64, &[KeyValue::new("sensor", t.label.clone())]);
+            self.temperature.record(
+                t.celsius as f64,
+                &[KeyValue::new("sensor", t.label.clone())],
+            );
         }
     }
 

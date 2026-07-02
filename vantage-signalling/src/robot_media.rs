@@ -13,12 +13,12 @@ use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
-use vantage_protocol::signalling::{IceServer, Signal};
 use vantage_protocol::SessionId;
+use vantage_protocol::signalling::{IceServer, Signal};
 
 use crate::peer::{
-    configure_ice, parse_sdp, wire_data_channel, wire_local_ice, wire_on_negotiation_needed,
-    PeerEvent, RawFrame,
+    PeerEvent, RawFrame, configure_ice, parse_sdp, wire_data_channel, wire_local_ice,
+    wire_on_negotiation_needed,
 };
 
 /// The single shared capture/encode engine. Owns the pipeline, the `rtptee`
@@ -43,7 +43,7 @@ impl RobotMedia {
         let srccaps = gst::ElementFactory::make("capsfilter")
             .property(
                 "caps",
-                &gst::Caps::builder("video/x-raw")
+                gst::Caps::builder("video/x-raw")
                     // Force I420 (4:2:0): cameras often negotiate YUYV (4:2:2), which
                     // x264enc baseline rejects. I420 also converts cleanly to RGB on
                     // the raw branch.
@@ -85,7 +85,7 @@ impl RobotMedia {
         let rtpcaps = gst::ElementFactory::make("capsfilter")
             .property(
                 "caps",
-                &gst::Caps::builder("application/x-rtp")
+                gst::Caps::builder("application/x-rtp")
                     .field("media", "video")
                     .field("encoding-name", "H264")
                     .field("payload", 96i32)
@@ -103,8 +103,19 @@ impl RobotMedia {
         let (rqueue, rconvert, rawsink_el) = build_raw_branch(&raw_tx)?;
 
         pipeline.add_many([
-            &source, &srcconvert, &srccaps, &tee, &equeue, &enc, &parse, &pay, &rtpcaps, &rtptee,
-            &rqueue, &rconvert, &rawsink_el,
+            &source,
+            &srcconvert,
+            &srccaps,
+            &tee,
+            &equeue,
+            &enc,
+            &parse,
+            &pay,
+            &rtpcaps,
+            &rtptee,
+            &rqueue,
+            &rconvert,
+            &rawsink_el,
         ])?;
         gst::Element::link_many([&source, &srcconvert, &srccaps, &tee])?;
         gst::Element::link_many([&equeue, &enc, &parse, &pay, &rtpcaps, &rtptee])?;
@@ -171,8 +182,8 @@ impl RobotMedia {
             .request_pad_simple("sink_%u")
             .context("webrtcbin refused a sink pad")?;
         qsrc.link(&wsink)?;
-        let transceiver = webrtcbin
-            .emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
+        let transceiver =
+            webrtcbin.emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
         transceiver.set_property(
             "direction",
             gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
@@ -203,7 +214,12 @@ impl RobotMedia {
                         // fall through. We can't return None here, but this path is
                         // unreachable if the factory-find guard above passed.
                         tracing::error!("rtpgccbwe build failed after factory found");
-                        return Some(gst::ElementFactory::make("identity").build().unwrap().to_value());
+                        return Some(
+                            gst::ElementFactory::make("identity")
+                                .build()
+                                .unwrap()
+                                .to_value(),
+                        );
                     }
                 };
                 let enc_weak = enc_weak.clone();
@@ -214,9 +230,7 @@ impl RobotMedia {
                     let kbps = (bps / 1000).clamp(300, 2500);
                     if let Some(enc) = enc_weak.upgrade() {
                         enc.set_property("bitrate", kbps);
-                        tracing::debug!(
-                            "adaptive bitrate: {kbps} kbit/s (estimate {bps} bit/s)"
-                        );
+                        tracing::debug!("adaptive bitrate: {kbps} kbit/s (estimate {bps} bit/s)");
                     }
                     None
                 });
@@ -224,9 +238,7 @@ impl RobotMedia {
                 Some(gcc.to_value())
             });
         } else {
-            tracing::warn!(
-                "rtpgccbwe absent — static bitrate (adaptive bitrate host-deferred)"
-            );
+            tracing::warn!("rtpgccbwe absent — static bitrate (adaptive bitrate host-deferred)");
         }
 
         // telemetry data channel + offer  (robot is offerer, reusing peer.rs glue)
@@ -266,9 +278,7 @@ impl RobotMedia {
             .all_headers(true)
             .build();
         let enc_src = self.enc.static_pad("src");
-        let sent = enc_src
-            .as_ref()
-            .is_some_and(|p| p.send_event(fku));
+        let sent = enc_src.as_ref().is_some_and(|p| p.send_event(fku));
         if !sent {
             tracing::warn!("force-key-unit not handled (new viewer waits for periodic IDR)");
         } else {
@@ -288,25 +298,33 @@ impl RobotMedia {
     /// `rtptee` src pad feeding this consumer is not mid-buffer, guaranteeing
     /// the unlink/remove is safe on a PLAYING pipeline.
     pub fn remove_consumer(&self, consumer: Consumer) {
-        let Consumer { session, webrtcbin, queue, rtptee_pad, .. } = consumer;
+        let Consumer {
+            session,
+            webrtcbin,
+            queue,
+            rtptee_pad,
+            ..
+        } = consumer;
         tracing::info!("removing consumer {session}");
         let pipeline = self.pipeline.clone();
         let rtptee = self.rtptee.clone();
 
-        rtptee_pad.clone().add_probe(gst::PadProbeType::IDLE, move |pad, _info| {
-            // 1. unlink rtptee → queue
-            if let Some(qsink) = queue.static_pad("sink") {
-                let _ = pad.unlink(&qsink);
-            }
-            // 2. remove queue + webrtcbin from the live pipeline and set to Null
-            let _ = pipeline.remove_many([&queue, &webrtcbin]);
-            let _ = queue.set_state(gst::State::Null);
-            let _ = webrtcbin.set_state(gst::State::Null);
-            // 3. release the request pad so rtptee stops producing for it
-            //    (allow-not-linked=true means zero consumers does not error the engine)
-            rtptee.release_request_pad(pad);
-            gst::PadProbeReturn::Remove
-        });
+        rtptee_pad
+            .clone()
+            .add_probe(gst::PadProbeType::IDLE, move |pad, _info| {
+                // 1. unlink rtptee → queue
+                if let Some(qsink) = queue.static_pad("sink") {
+                    let _ = pad.unlink(&qsink);
+                }
+                // 2. remove queue + webrtcbin from the live pipeline and set to Null
+                let _ = pipeline.remove_many([&queue, &webrtcbin]);
+                let _ = queue.set_state(gst::State::Null);
+                let _ = webrtcbin.set_state(gst::State::Null);
+                // 3. release the request pad so rtptee stops producing for it
+                //    (allow-not-linked=true means zero consumers does not error the engine)
+                rtptee.release_request_pad(pad);
+                gst::PadProbeReturn::Remove
+            });
     }
 
     /// Await the next raw camera frame (RGB888) from the pre-encode tee branch.
@@ -338,10 +356,7 @@ fn control_dc_options() -> gst::Structure {
 
 /// Forward inbound `control`-channel bytes as `PeerEvent::Control`. The robot both
 /// creates and receives on this channel (DCEP channels are bidirectional).
-fn wire_control_channel(
-    dc: &gst_webrtc::WebRTCDataChannel,
-    tx: &mpsc::UnboundedSender<PeerEvent>,
-) {
+fn wire_control_channel(dc: &gst_webrtc::WebRTCDataChannel, tx: &mpsc::UnboundedSender<PeerEvent>) {
     let tx = tx.clone();
     dc.connect("on-message-data", false, move |vals| {
         if let Ok(bytes) = vals[1].get::<glib::Bytes>() {
@@ -397,7 +412,11 @@ fn build_raw_branch(
     let rqueue = gst::ElementFactory::make("queue").build()?;
     let rconvert = gst::ElementFactory::make("videoconvert").build()?;
     let rawsink = gst_app::AppSink::builder()
-        .caps(&gst::Caps::builder("video/x-raw").field("format", "RGB").build())
+        .caps(
+            &gst::Caps::builder("video/x-raw")
+                .field("format", "RGB")
+                .build(),
+        )
         .max_buffers(2)
         .drop(true)
         .build();
@@ -439,8 +458,12 @@ fn build_raw_branch(
 
 /// Request a `src_%u` pad off the tee and link it to a downstream element's sink.
 fn link_tee(tee: &gst::Element, downstream: &gst::Element) -> Result<()> {
-    let tee_src = tee.request_pad_simple("src_%u").context("tee has no src pad")?;
-    let sink = downstream.static_pad("sink").context("downstream has no sink pad")?;
+    let tee_src = tee
+        .request_pad_simple("src_%u")
+        .context("tee has no src pad")?;
+    let sink = downstream
+        .static_pad("sink")
+        .context("downstream has no sink pad")?;
     tee_src.link(&sink)?;
     Ok(())
 }

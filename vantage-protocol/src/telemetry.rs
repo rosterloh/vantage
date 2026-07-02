@@ -27,7 +27,10 @@ mod tests {
             cpu_percent: 12.5,
             mem_used_mb: 2048,
             mem_total_mb: 8192,
-            temps: vec![TempReading { label: "cpu".into(), celsius: 47.0 }],
+            temps: vec![TempReading {
+                label: "cpu".into(),
+                celsius: 47.0,
+            }],
             uptime_s: 3600,
         };
         let json = serde_json::to_string(&info).unwrap();

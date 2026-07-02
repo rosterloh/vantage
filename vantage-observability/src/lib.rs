@@ -21,8 +21,8 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use tracing_subscriber::Layer;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::prelude::*;
 
 /// Re-export so binaries record metrics against the exact same `opentelemetry`
@@ -90,7 +90,9 @@ fn init_otlp(service_name: &str, endpoint: &str) -> Result<OtelGuard, Box<dyn st
         .build()?;
     let _enter = runtime.enter();
 
-    let resource = Resource::builder().with_service_name(service_name.to_string()).build();
+    let resource = Resource::builder()
+        .with_service_name(service_name.to_string())
+        .build();
 
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
@@ -139,7 +141,12 @@ fn init_otlp(service_name: &str, endpoint: &str) -> Result<OtelGuard, Box<dyn st
     tracing::info!(%endpoint, service = service_name, "opentelemetry export enabled (otlp/grpc)");
 
     Ok(OtelGuard {
-        providers: Some(Providers { tracer: tracer_provider, logger: logger_provider, meter: meter_provider, runtime }),
+        providers: Some(Providers {
+            tracer: tracer_provider,
+            logger: logger_provider,
+            meter: meter_provider,
+            runtime,
+        }),
     })
 }
 
@@ -162,7 +169,9 @@ fn otel_filter() -> EnvFilter {
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        let Some(p) = self.providers.take() else { return };
+        let Some(p) = self.providers.take() else {
+            return;
+        };
         // Flush in the documented order (tracer, logger, meter) while the
         // export runtime is still alive, then tear the runtime down without
         // blocking — a blocking drop would panic when `main` is itself async.

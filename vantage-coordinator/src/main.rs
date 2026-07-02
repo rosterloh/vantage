@@ -4,7 +4,7 @@ mod sessions;
 
 use std::sync::Arc;
 
-use routes::{router, AppState};
+use routes::{AppState, router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,7 +22,9 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         let meter = vantage_observability::opentelemetry::global::meter("vantage-coordinator");
         let robots = meter.u64_gauge("vantage.coordinator.robots_online").build();
-        let sessions = meter.u64_gauge("vantage.coordinator.sessions_active").build();
+        let sessions = meter
+            .u64_gauge("vantage.coordinator.sessions_active")
+            .build();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {

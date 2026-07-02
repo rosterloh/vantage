@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use vantage_protocol::signalling::RobotInfo;
 use vantage_protocol::RobotId;
+use vantage_protocol::signalling::RobotInfo;
 
 struct Entry {
     info: RobotInfo,
@@ -17,17 +17,29 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(ttl: Duration) -> Self {
-        Self { robots: HashMap::new(), ttl }
+        Self {
+            robots: HashMap::new(),
+            ttl,
+        }
     }
 
     pub fn register(&mut self, info: RobotInfo, now: Instant) {
-        self.robots.insert(info.id.clone(), Entry { info, last_seen: now });
+        self.robots.insert(
+            info.id.clone(),
+            Entry {
+                info,
+                last_seen: now,
+            },
+        );
     }
 
     /// Returns false if the robot was unknown (e.g. already expired).
     pub fn heartbeat(&mut self, id: &RobotId, now: Instant) -> bool {
         match self.robots.get_mut(id) {
-            Some(e) => { e.last_seen = now; true }
+            Some(e) => {
+                e.last_seen = now;
+                true
+            }
             None => false,
         }
     }
@@ -39,7 +51,8 @@ impl Registry {
     /// Drop entries whose last heartbeat is older than the TTL.
     pub fn prune(&mut self, now: Instant) {
         let ttl = self.ttl;
-        self.robots.retain(|_, e| now.duration_since(e.last_seen) < ttl);
+        self.robots
+            .retain(|_, e| now.duration_since(e.last_seen) < ttl);
     }
 
     /// Current live robots (call `prune` first for accuracy).
@@ -57,7 +70,11 @@ mod tests {
     use super::*;
 
     fn robot(id: &str) -> RobotInfo {
-        RobotInfo { id: RobotId(id.into()), name: id.into(), capabilities: vec![] }
+        RobotInfo {
+            id: RobotId(id.into()),
+            name: id.into(),
+            capabilities: vec![],
+        }
     }
 
     #[test]

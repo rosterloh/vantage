@@ -15,7 +15,10 @@ mod tests {
 
     #[test]
     fn round_trips_through_codec() {
-        let stats = FleetStats { providers_online: 1, consumers_connected: 2 };
+        let stats = FleetStats {
+            providers_online: 1,
+            consumers_connected: 2,
+        };
         let bytes = crate::codec::encode(&stats).unwrap();
         assert_eq!(crate::codec::decode::<FleetStats>(&bytes).unwrap(), stats);
     }

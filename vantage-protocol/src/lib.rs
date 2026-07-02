@@ -6,6 +6,6 @@ pub mod ids;
 pub mod signalling;
 pub mod telemetry;
 
-pub use control::{ControlMsg, CONTROL_LABEL};
+pub use control::{CONTROL_LABEL, ControlMsg};
 pub use fleet::FleetStats;
 pub use ids::{RobotId, SessionId};

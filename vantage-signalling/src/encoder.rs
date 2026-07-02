@@ -100,6 +100,9 @@ mod tests {
     #[test]
     fn selection_is_deterministic_and_present() {
         gst::init().unwrap();
-        assert!(selected_encoder_name().is_some(), "expected at least x264enc");
+        assert!(
+            selected_encoder_name().is_some(),
+            "expected at least x264enc"
+        );
     }
 }

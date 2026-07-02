@@ -44,7 +44,10 @@ mod tests {
     fn open_then_lookup() {
         let mut s = Sessions::default();
         s.open(SessionId("sess-1".into()), RobotId("r1".into()));
-        assert_eq!(s.robot_for(&SessionId("sess-1".into())), Some(&RobotId("r1".into())));
+        assert_eq!(
+            s.robot_for(&SessionId("sess-1".into())),
+            Some(&RobotId("r1".into()))
+        );
         assert_eq!(s.consumer_count(), 1);
     }
 
@@ -52,7 +55,10 @@ mod tests {
     fn close_returns_robot_and_drops_count() {
         let mut s = Sessions::default();
         s.open(SessionId("sess-1".into()), RobotId("r1".into()));
-        assert_eq!(s.close(&SessionId("sess-1".into())), Some(RobotId("r1".into())));
+        assert_eq!(
+            s.close(&SessionId("sess-1".into())),
+            Some(RobotId("r1".into()))
+        );
         assert_eq!(s.consumer_count(), 0);
     }
 

@@ -1,4 +1,4 @@
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
@@ -29,7 +29,10 @@ mod tests {
             cpu_percent: 3.0,
             mem_used_mb: 100,
             mem_total_mb: 200,
-            temps: vec![TempReading { label: "soc".into(), celsius: 40.0 }],
+            temps: vec![TempReading {
+                label: "soc".into(),
+                celsius: 40.0,
+            }],
             uptime_s: 10,
         };
         let bytes = encode(&info).unwrap();

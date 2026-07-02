@@ -2,15 +2,15 @@ mod discovery;
 mod session;
 mod ui;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use session::{run_session, UiSink};
+use session::{UiSink, run_session};
 use slint::ComponentHandle;
 use tokio::sync::mpsc;
 use ui::{AppWindow, SlintSink};
-use vantage_protocol::telemetry::DeviceInfo;
 use vantage_protocol::ControlMsg;
+use vantage_protocol::telemetry::DeviceInfo;
 use vantage_signalling::peer::VideoFrame;
 
 fn coordinator_url() -> String {
@@ -52,7 +52,10 @@ async fn headless_control(control_tx: mpsc::UnboundedSender<ControlMsg>) {
             return;
         }
         let msg = if kind == "move" {
-            ControlMsg::Move { linear: 0.5, angular: 0.0 }
+            ControlMsg::Move {
+                linear: 0.5,
+                angular: 0.0,
+            }
         } else {
             ControlMsg::KeepAlive
         };
@@ -70,8 +73,12 @@ fn main() -> anyhow::Result<()> {
 
     // Headless mode for display-less verification (CI / sandboxes).
     if std::env::var("VANTAGE_HEADLESS").is_ok_and(|v| v != "0" && !v.is_empty()) {
-        let sink = Arc::new(LogSink { frames: AtomicU64::new(0) });
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let sink = Arc::new(LogSink {
+            frames: AtomicU64::new(0),
+        });
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
         return rt.block_on(async move {
             tokio::spawn(headless_control(control_tx));
             run_session(coordinator_url(), sink, control_rx).await
@@ -92,12 +99,19 @@ struct LogSink {
 impl UiSink for LogSink {
     fn frame(&self, frame: VideoFrame) {
         let n = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
-        if n == 1 || n % 30 == 0 {
+        if n == 1 || n.is_multiple_of(30) {
             tracing::info!("video frame {}x{} (#{n})", frame.width, frame.height);
         }
     }
     fn telemetry(&self, info: &DeviceInfo) {
-        tracing::info!("telemetry: cpu={:.1}% mem={}/{}MB", info.cpu_percent, info.mem_used_mb, info.mem_total_mb);
+        tracing::info!(
+            "telemetry: cpu={:.1}% mem={}/{}MB",
+            info.cpu_percent,
+            info.mem_used_mb,
+            info.mem_total_mb
+        );
     }
-    fn status(&self, text: &str) { tracing::info!("status: {text}"); }
+    fn status(&self, text: &str) {
+        tracing::info!("status: {text}");
+    }
 }

@@ -3,16 +3,16 @@
 //! unreachable. The direct path reuses the shared `RobotMedia` engine and applies
 //! the same teleop watchdog as the coordinator path — no safety regression offline.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::net::TcpListener;
-use vantage_protocol::discovery::{advert_txt, MDNS_SERVICE_TYPE};
-use vantage_protocol::signalling::{ClientMsg, RobotInfo, ServerMsg};
 use vantage_protocol::SessionId;
+use vantage_protocol::discovery::{MDNS_SERVICE_TYPE, advert_txt};
+use vantage_protocol::signalling::{ClientMsg, RobotInfo, ServerMsg};
 use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::RobotMedia;
 use vantage_signalling::ws::PeerWs;
@@ -74,17 +74,15 @@ pub fn advertise(info: &RobotInfo, port: u16) -> Result<ServiceDaemon> {
 /// Drive one directly-connected client: create a consumer off the shared engine,
 /// offer immediately (robot is offerer), relay signalling, and enforce the teleop
 /// watchdog. Mirrors the coordinator path but scoped to a single peer.
-async fn handle_direct_client(
-    media: Arc<RobotMedia>,
-    stream: tokio::net::TcpStream,
-) -> Result<()> {
+async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStream) -> Result<()> {
     let ws = PeerWs::accept(stream).await?;
     let (mut tx, mut rx) = ws.split();
 
     // Unique session id per direct peer (a counter, so concurrent clients never collide).
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let session = SessionId(format!("direct-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, PeerEvent)>();
+    let (events_tx, mut events_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(SessionId, PeerEvent)>();
 
     // Creating the consumer builds the offer and both data channels immediately.
     let consumer = media.add_consumer(session.clone(), events_tx)?;

@@ -9,7 +9,7 @@ use gstreamer_video::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use vantage_protocol::control::{ControlMsg, CONTROL_LABEL};
+use vantage_protocol::control::{CONTROL_LABEL, ControlMsg};
 use vantage_protocol::signalling::{IceServer, Signal};
 
 #[derive(Debug)]
@@ -92,17 +92,18 @@ impl Peer {
 
         let tx2 = tx.clone();
         let control_slot = peer.control_channel.clone();
-        peer.webrtcbin.connect("on-data-channel", false, move |vals| {
-            let dc = vals[1].get::<gst_webrtc::WebRTCDataChannel>().unwrap();
-            // The robot creates two channels on one SCTP transport (no renegotiation);
-            // route by label — `control` is our operator→robot send channel.
-            if dc.property::<String>("label") == CONTROL_LABEL {
-                *control_slot.lock().unwrap() = Some(dc);
-            } else {
-                wire_data_channel(&dc, &tx2);
-            }
-            None
-        });
+        peer.webrtcbin
+            .connect("on-data-channel", false, move |vals| {
+                let dc = vals[1].get::<gst_webrtc::WebRTCDataChannel>().unwrap();
+                // The robot creates two channels on one SCTP transport (no renegotiation);
+                // route by label — `control` is our operator→robot send channel.
+                if dc.property::<String>("label") == CONTROL_LABEL {
+                    *control_slot.lock().unwrap() = Some(dc);
+                } else {
+                    wire_data_channel(&dc, &tx2);
+                }
+                None
+            });
         wire_video_receiver(&peer.pipeline, &peer.webrtcbin, &peer.frames_tx);
 
         Ok(peer)
@@ -123,10 +124,8 @@ impl Peer {
         match signal {
             Signal::Offer { sdp } => {
                 let desc = parse_sdp(&sdp, gst_webrtc::WebRTCSDPType::Offer)?;
-                self.webrtcbin.emit_by_name::<()>(
-                    "set-remote-description",
-                    &[&desc, &None::<gst::Promise>],
-                );
+                self.webrtcbin
+                    .emit_by_name::<()>("set-remote-description", &[&desc, &None::<gst::Promise>]);
                 let bin = self.webrtcbin.clone();
                 let tx = self.events_tx.clone();
                 let promise = gst::Promise::with_change_func(move |reply| {
@@ -151,10 +150,8 @@ impl Peer {
             }
             Signal::Answer { sdp } => {
                 let desc = parse_sdp(&sdp, gst_webrtc::WebRTCSDPType::Answer)?;
-                self.webrtcbin.emit_by_name::<()>(
-                    "set-remote-description",
-                    &[&desc, &None::<gst::Promise>],
-                );
+                self.webrtcbin
+                    .emit_by_name::<()>("set-remote-description", &[&desc, &None::<gst::Promise>]);
             }
             Signal::Ice {
                 candidate,
@@ -213,7 +210,9 @@ pub(crate) fn configure_ice(webrtcbin: &gst::Element, ice_servers: &[IceServer])
                 webrtcbin.set_property("stun-server", url);
             } else if url.starts_with("turn:") {
                 // webrtcbin/libnice require the turn://[user:pass@]host:port form.
-                let host = url.trim_start_matches("turn://").trim_start_matches("turn:");
+                let host = url
+                    .trim_start_matches("turn://")
+                    .trim_start_matches("turn:");
                 let with_creds = match (&s.username, &s.credential) {
                     (Some(u), Some(p)) => format!("turn://{u}:{p}@{host}"),
                     _ => format!("turn://{host}"),
@@ -326,7 +325,11 @@ fn build_decode_branch(
     let convert = gst::ElementFactory::make("videoconvert").build()?;
 
     let appsink = gst_app::AppSink::builder()
-        .caps(&gst::Caps::builder("video/x-raw").field("format", "RGBA").build())
+        .caps(
+            &gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .build(),
+        )
         .max_buffers(2)
         .drop(true)
         .build();
@@ -339,8 +342,8 @@ fn build_decode_branch(
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
-                    let info = gst_video::VideoInfo::from_caps(caps)
-                        .map_err(|_| gst::FlowError::Error)?;
+                    let info =
+                        gst_video::VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
                     let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
                         .map_err(|_| gst::FlowError::Error)?;
 

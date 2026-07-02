@@ -1,9 +1,9 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
-use vantage_protocol::codec;
-use vantage_protocol::signalling::{default_ice, ClientMsg, IceServer, ServerMsg};
-use vantage_protocol::telemetry::DeviceInfo;
 use vantage_protocol::ControlMsg;
+use vantage_protocol::codec;
+use vantage_protocol::signalling::{ClientMsg, IceServer, ServerMsg, default_ice};
+use vantage_protocol::telemetry::DeviceInfo;
 use vantage_signalling::peer::{Peer, PeerEvent, VideoFrame};
 use vantage_signalling::ws::{CoordinatorWs, CoordinatorWsRx, CoordinatorWsTx};
 
@@ -53,9 +53,15 @@ async fn run_via_coordinator(
             None => anyhow::bail!("coordinator closed before sending robot list"),
         }
     };
-    let target = robots.into_iter().next().ok_or_else(|| anyhow::anyhow!("no robots online"))?;
+    let target = robots
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no robots online"))?;
     ui.status(&format!("connecting to {}", target.name));
-    ws.send(&ClientMsg::Connect { robot: target.id.clone() }).await?;
+    ws.send(&ClientMsg::Connect {
+        robot: target.id.clone(),
+    })
+    .await?;
 
     let ice = fetch_ice(&coord).await?;
     let peer = Arc::new(Peer::new(&ice)?);
@@ -75,7 +81,10 @@ async fn run_via_mdns(
         .next()
         .ok_or_else(|| anyhow::anyhow!("no robots found on the LAN via mDNS"))?;
     tracing::info!("mDNS: discovered {} at {}", target.id, target.addr);
-    ui.status(&format!("connecting to {} (LAN) at {}", target.name, target.addr));
+    ui.status(&format!(
+        "connecting to {} (LAN) at {}",
+        target.name, target.addr
+    ));
 
     let ws = CoordinatorWs::connect(&format!("ws://{}", target.addr)).await?;
     // No coordinator to fetch ICE from; host candidates carry the LAN.
@@ -96,7 +105,9 @@ async fn run_answer_loop(
     // Metric instruments — no-ops until a global meter provider is installed.
     let meter = vantage_observability::opentelemetry::global::meter("vantage-client");
     let frames_rx = meter.u64_counter("vantage.client.frames_received").build();
-    let telemetry_rx = meter.u64_counter("vantage.client.telemetry_received").build();
+    let telemetry_rx = meter
+        .u64_counter("vantage.client.telemetry_received")
+        .build();
 
     // Frame pump: decoded frames -> UI.
     {
@@ -153,6 +164,9 @@ async fn run_answer_loop(
 
 async fn fetch_ice(coord: &str) -> Result<Vec<IceServer>> {
     let http = coord.replacen("ws", "http", 1);
-    let servers = reqwest::get(format!("{http}/ice")).await?.json::<Vec<IceServer>>().await?;
+    let servers = reqwest::get(format!("{http}/ice"))
+        .await?
+        .json::<Vec<IceServer>>()
+        .await?;
     Ok(servers)
 }

@@ -22,7 +22,13 @@ mod tests {
 
     #[test]
     fn control_msg_round_trips_each_variant() {
-        for msg in [ControlMsg::Move { linear: 0.5, angular: -0.25 }, ControlMsg::KeepAlive] {
+        for msg in [
+            ControlMsg::Move {
+                linear: 0.5,
+                angular: -0.25,
+            },
+            ControlMsg::KeepAlive,
+        ] {
             let bytes = crate::codec::encode(&msg).unwrap();
             assert_eq!(crate::codec::decode::<ControlMsg>(&bytes).unwrap(), msg);
         }

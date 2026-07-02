@@ -3,7 +3,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    accept_async, connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream, accept_async, connect_async, tungstenite::Message,
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -28,7 +28,7 @@ impl CoordinatorWs {
 
     pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
         let txt = serde_json::to_string(msg)?;
-        self.inner.send(Message::Text(txt.into())).await?;
+        self.inner.send(Message::Text(txt)).await?;
         Ok(())
     }
 
@@ -51,7 +51,7 @@ impl CoordinatorWs {
 impl CoordinatorWsTx {
     pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
         let txt = serde_json::to_string(msg)?;
-        self.sink.send(Message::Text(txt.into())).await?;
+        self.sink.send(Message::Text(txt)).await?;
         Ok(())
     }
 }
@@ -96,7 +96,7 @@ impl PeerWs {
 impl PeerWsTx {
     pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
         let txt = serde_json::to_string(msg)?;
-        self.sink.send(Message::Text(txt.into())).await?;
+        self.sink.send(Message::Text(txt)).await?;
         Ok(())
     }
 }

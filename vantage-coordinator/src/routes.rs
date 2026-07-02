@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use vantage_protocol::signalling::{ClientMsg, IceServer, RobotMsg, ServerMsg};
 use vantage_protocol::{FleetStats, RobotId, SessionId};
 
@@ -67,7 +67,10 @@ async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         reg.len()
     };
     let consumers_connected = state.sessions.lock().await.consumer_count();
-    Json(FleetStats { providers_online, consumers_connected })
+    Json(FleetStats {
+        providers_online,
+        consumers_connected,
+    })
 }
 
 async fn robot_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -96,21 +99,37 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
     let mut my_id: Option<RobotId> = None;
 
     while let Some(Ok(raw)) = rx_ws.next().await {
-        let Some(text) = split_text(raw) else { continue };
+        let Some(text) = split_text(raw) else {
+            continue;
+        };
         let Ok(msg) = serde_json::from_str::<RobotMsg>(&text) else {
-            let _ = tx_out.send(ServerMsg::Error { message: "bad robot message".into() });
+            let _ = tx_out.send(ServerMsg::Error {
+                message: "bad robot message".into(),
+            });
             continue;
         };
         match msg {
             RobotMsg::Register(info) => {
                 let id = info.id.clone();
-                state.registry.lock().await.register(info, std::time::Instant::now());
-                state.peers.lock().await.insert(id.0.clone(), tx_out.clone());
+                state
+                    .registry
+                    .lock()
+                    .await
+                    .register(info, std::time::Instant::now());
+                state
+                    .peers
+                    .lock()
+                    .await
+                    .insert(id.0.clone(), tx_out.clone());
                 my_id = Some(id);
             }
             RobotMsg::Heartbeat => {
                 if let Some(id) = &my_id {
-                    state.registry.lock().await.heartbeat(id, std::time::Instant::now());
+                    state
+                        .registry
+                        .lock()
+                        .await
+                        .heartbeat(id, std::time::Instant::now());
                 }
             }
             RobotMsg::Signal { to, signal } => {
@@ -126,7 +145,14 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
         // Notify any clients attached to this robot.
         let orphaned = state.sessions.lock().await.sessions_for(&id);
         for s in orphaned {
-            relay_to(&state, &s.0, ServerMsg::Error { message: "robot disconnected".into() }).await;
+            relay_to(
+                &state,
+                &s.0,
+                ServerMsg::Error {
+                    message: "robot disconnected".into(),
+                },
+            )
+            .await;
             state.sessions.lock().await.close(&s);
         }
     }
@@ -155,12 +181,20 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
 
     // Each client connection is one session.
     let session = SessionId(format!("sess-{}", uuid_like()));
-    state.peers.lock().await.insert(session.0.clone(), tx_out.clone());
+    state
+        .peers
+        .lock()
+        .await
+        .insert(session.0.clone(), tx_out.clone());
 
     while let Some(Ok(raw)) = rx_ws.next().await {
-        let Some(text) = split_text(raw) else { continue };
+        let Some(text) = split_text(raw) else {
+            continue;
+        };
         let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) else {
-            let _ = tx_out.send(ServerMsg::Error { message: "bad client message".into() });
+            let _ = tx_out.send(ServerMsg::Error {
+                message: "bad client message".into(),
+            });
             continue;
         };
         match msg {
@@ -171,17 +205,38 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                 let _ = tx_out.send(ServerMsg::RobotList { robots });
             }
             ClientMsg::Connect { robot } => {
-                state.sessions.lock().await.open(session.clone(), robot.clone());
+                state
+                    .sessions
+                    .lock()
+                    .await
+                    .open(session.clone(), robot.clone());
                 // Tell the robot a client arrived (so it builds its peer + offer).
-                relay_to(&state, &robot.0, ServerMsg::ClientConnected { session: session.clone() }).await;
-                let _ = tx_out.send(ServerMsg::Connected { robot, session: session.clone() });
+                relay_to(
+                    &state,
+                    &robot.0,
+                    ServerMsg::ClientConnected {
+                        session: session.clone(),
+                    },
+                )
+                .await;
+                let _ = tx_out.send(ServerMsg::Connected {
+                    robot,
+                    session: session.clone(),
+                });
             }
             ClientMsg::Signal { signal } => {
                 // Route to the robot of this session, tagging our session id.
                 let robot = state.sessions.lock().await.robot_for(&session).cloned();
                 if let Some(robot) = robot {
-                    relay_to(&state, &robot.0,
-                        ServerMsg::Signal { from: Some(session.clone()), signal }).await;
+                    relay_to(
+                        &state,
+                        &robot.0,
+                        ServerMsg::Signal {
+                            from: Some(session.clone()),
+                            signal,
+                        },
+                    )
+                    .await;
                 }
             }
         }
@@ -189,7 +244,14 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
 
     // Cleanup: client disconnected -> close session, notify robot.
     if let Some(robot) = state.sessions.lock().await.close(&session) {
-        relay_to(&state, &robot.0, ServerMsg::ClientDisconnected { session: session.clone() }).await;
+        relay_to(
+            &state,
+            &robot.0,
+            ServerMsg::ClientDisconnected {
+                session: session.clone(),
+            },
+        )
+        .await;
     }
     state.peers.lock().await.remove(&session.0);
     pump.abort();
@@ -198,7 +260,10 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
 /// Tiny unique-ish id without pulling in the uuid crate for the PoC.
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("{n:x}")
 }
 

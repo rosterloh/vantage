@@ -60,7 +60,10 @@ impl Watchdog {
         for s in &newly_stale {
             self.tripped.insert(s.clone(), true);
         }
-        newly_stale.into_iter().map(|s| (s, "control stale")).collect()
+        newly_stale
+            .into_iter()
+            .map(|s| (s, "control stale"))
+            .collect()
     }
 
     /// Whether commands for this session may currently be acted on. False for an

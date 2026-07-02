@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use vantage_protocol::codec;
-use vantage_protocol::signalling::{default_ice, IceServer, RobotInfo, RobotMsg, ServerMsg};
+use vantage_protocol::signalling::{IceServer, RobotInfo, RobotMsg, ServerMsg, default_ice};
 use vantage_protocol::{RobotId, SessionId};
 use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::{Consumer, RobotMedia};
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
                 let (w, h) = (frame.width, frame.height);
                 match bridge.publish(frame) {
                     Ok(()) => {
-                        if n == 1 || n % 30 == 0 {
+                        if n == 1 || n.is_multiple_of(30) {
                             tracing::info!("published ros image {w}x{h} (#{n})");
                         }
                     }
@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
             while let Some(frame) = media_raw.recv_raw_frame().await {
                 n += 1;
                 metrics.frame_published();
-                if n == 1 || n % 30 == 0 {
+                if n == 1 || n.is_multiple_of(30) {
                     tracing::info!(
                         "raw frame {}x{} {} (#{n})",
                         frame.width,

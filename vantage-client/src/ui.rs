@@ -67,7 +67,10 @@ pub fn wire_control_input(ui: &AppWindow, control_tx: mpsc::UnboundedSender<Cont
     {
         let tx = control_tx.clone();
         ui.on_key_released_text(move |_| {
-            let _ = tx.send(ControlMsg::Move { linear: 0.0, angular: 0.0 });
+            let _ = tx.send(ControlMsg::Move {
+                linear: 0.0,
+                angular: 0.0,
+            });
         });
     }
     // Keepalive so an idle hold does not trip the watchdog. The timer lives on the
@@ -97,7 +100,10 @@ impl UiSink for SlintSink {
     fn frame(&self, frame: VideoFrame) {
         // SharedPixelBuffer is Send; Image is not, so build it inside the event loop.
         let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-            &frame.rgba, frame.width, frame.height);
+            &frame.rgba,
+            frame.width,
+            frame.height,
+        );
         let _ = self
             .ui
             .upgrade_in_event_loop(move |ui| ui.set_video_frame(Image::from_rgba8(buf)));
@@ -105,12 +111,21 @@ impl UiSink for SlintSink {
     fn telemetry(&self, info: &DeviceInfo) {
         let text: SharedString = format!(
             "CPU {:.1}%\nMem {}/{} MB\nTemps {}\nUptime {}s",
-            info.cpu_percent, info.mem_used_mb, info.mem_total_mb, info.temps.len(), info.uptime_s
-        ).into();
-        let _ = self.ui.upgrade_in_event_loop(move |ui| ui.set_telemetry_text(text));
+            info.cpu_percent,
+            info.mem_used_mb,
+            info.mem_total_mb,
+            info.temps.len(),
+            info.uptime_s
+        )
+        .into();
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_telemetry_text(text));
     }
     fn status(&self, text: &str) {
         let text: SharedString = text.to_string().into();
-        let _ = self.ui.upgrade_in_event_loop(move |ui| ui.set_status_text(text));
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_status_text(text));
     }
 }

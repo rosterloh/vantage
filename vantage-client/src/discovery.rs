@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use vantage_protocol::discovery::{robot_from_txt, MDNS_SERVICE_TYPE};
+use vantage_protocol::discovery::{MDNS_SERVICE_TYPE, robot_from_txt};
 
 /// A robot discovered on the LAN, with its direct signalling endpoint.
 pub struct Discovered {
@@ -35,19 +35,19 @@ pub async fn discover(timeout: Duration) -> Result<Vec<Discovered>> {
                     .iter()
                     .map(|p| (p.key().to_string(), p.val_str().to_string()))
                     .collect();
-                if let Some((id, name)) = robot_from_txt(&props) {
-                    if let Some(ip) = info.get_addresses().iter().next() {
-                        found.push(Discovered {
-                            id,
-                            name,
-                            addr: SocketAddr::new(*ip, info.get_port()),
-                        });
-                    }
+                if let Some((id, name)) = robot_from_txt(&props)
+                    && let Some(ip) = info.get_addresses().iter().next()
+                {
+                    found.push(Discovered {
+                        id,
+                        name,
+                        addr: SocketAddr::new(*ip, info.get_port()),
+                    });
                 }
             }
             Ok(Ok(_)) => {} // other service events (found/removed) — keep waiting
             Ok(Err(_)) => break, // browse channel closed
-            Err(_) => break,     // timeout elapsed
+            Err(_) => break, // timeout elapsed
         }
     }
     let _ = daemon.shutdown();

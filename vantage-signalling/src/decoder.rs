@@ -57,6 +57,9 @@ mod tests {
     #[test]
     fn selection_is_deterministic_and_present() {
         gst::init().unwrap();
-        assert!(selected_decoder_name().is_some(), "expected at least avdec_h264");
+        assert!(
+            selected_decoder_name().is_some(),
+            "expected at least avdec_h264"
+        );
     }
 }
