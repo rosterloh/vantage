@@ -18,17 +18,28 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      # GStreamer dev libraries for the vantage-signalling WebRTC pipeline.
+      # GStreamer dev libraries (compile-time) plus the runtime plugins the
+      # vantage-signalling tests instantiate: videotestsrc/videoconvert (base),
+      # rtph264pay (good), webrtcbin (bad), x264enc (ugly), avdec_h264 (libav),
+      # and libnice for webrtcbin ICE.
+      # libfontconfig1-dev is required by slint (via yeslogic-fontconfig-sys) in vantage-client.
       # The `ros` feature (r2r) needs a full ROS 2 install and is left off here.
-      - name: Install GStreamer
+      - name: Install system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            gstreamer1.0-nice \
+            libfontconfig1-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

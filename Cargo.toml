@@ -22,7 +22,7 @@ anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-mdns-sd = "0.11"
+mdns-sd = "0.20"
 
 # OpenTelemetry (logs, metrics, traces) exported over OTLP/gRPC. Versions must
 # move together — tracing-opentelemetry 0.33 pins the opentelemetry 0.32 line.
