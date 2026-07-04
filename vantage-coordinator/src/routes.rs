@@ -20,8 +20,10 @@ pub type Outbound = mpsc::UnboundedSender<ServerMsg>;
 pub struct AppState {
     pub registry: Mutex<Registry>,
     pub sessions: Mutex<Sessions>,
-    /// session/robot id (as string) -> its outbound sender
-    pub peers: Mutex<std::collections::HashMap<String, Outbound>>,
+    /// session/robot id (as string) -> (owning connection token, its outbound sender).
+    /// The token lets cleanup tell whether the entry still belongs to the socket
+    /// tearing itself down, or was already replaced by a reconnect.
+    pub peers: Mutex<std::collections::HashMap<String, (u64, Outbound)>>,
     pub ice_servers: Vec<IceServer>,
 }
 
@@ -93,6 +95,7 @@ async fn client_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> 
 
 #[tracing::instrument(skip_all)]
 pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
+    let conn = next_conn_id();
     let (mut tx_ws, mut rx_ws) = socket.split();
     let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();
 
@@ -121,6 +124,22 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
         match msg {
             RobotMsg::Register(info) => {
                 let id = info.id.clone();
+                // Re-Register with a different id on the same socket: evict the
+                // previous id's entries, but only if we still own them.
+                if let Some(prev) = &my_id
+                    && *prev != id
+                {
+                    let owned = state
+                        .peers
+                        .lock()
+                        .await
+                        .get(&prev.0)
+                        .is_some_and(|(c, _)| *c == conn);
+                    if owned {
+                        state.registry.lock().await.remove(prev);
+                        state.peers.lock().await.remove(&prev.0);
+                    }
+                }
                 state
                     .registry
                     .lock()
@@ -130,7 +149,7 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
                     .peers
                     .lock()
                     .await
-                    .insert(id.0.clone(), tx_out.clone());
+                    .insert(id.0.clone(), (conn, tx_out.clone()));
                 my_id = Some(id);
             }
             RobotMsg::Heartbeat => {
@@ -148,35 +167,45 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Cleanup: robot disconnected.
+    // Cleanup: robot disconnected. Only tear down if this socket still owns the
+    // entry — a reconnect on a newer socket may already have replaced it.
     if let Some(id) = my_id {
-        state.registry.lock().await.remove(&id);
-        state.peers.lock().await.remove(&id.0);
-        // Notify any clients attached to this robot.
-        let orphaned = state.sessions.lock().await.sessions_for(&id);
-        for s in orphaned {
-            relay_to(
-                &state,
-                &s.0,
-                ServerMsg::Error {
-                    message: "robot disconnected".into(),
-                },
-            )
-            .await;
-            state.sessions.lock().await.close(&s);
+        let owned = state
+            .peers
+            .lock()
+            .await
+            .get(&id.0)
+            .is_some_and(|(c, _)| *c == conn);
+        if owned {
+            state.registry.lock().await.remove(&id);
+            state.peers.lock().await.remove(&id.0);
+            // Notify any clients attached to this robot.
+            let orphaned = state.sessions.lock().await.sessions_for(&id);
+            for s in orphaned {
+                relay_to(
+                    &state,
+                    &s.0,
+                    ServerMsg::Error {
+                        message: "robot disconnected".into(),
+                    },
+                )
+                .await;
+                state.sessions.lock().await.close(&s);
+            }
         }
     }
     pump.abort();
 }
 
 async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
-    if let Some(out) = state.peers.lock().await.get(peer_key) {
+    if let Some((_, out)) = state.peers.lock().await.get(peer_key) {
         let _ = out.send(msg);
     }
 }
 
 #[tracing::instrument(skip_all)]
 pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
+    let conn = next_conn_id();
     let (mut tx_ws, mut rx_ws) = socket.split();
     let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();
 
@@ -195,7 +224,7 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
         .peers
         .lock()
         .await
-        .insert(session.0.clone(), tx_out.clone());
+        .insert(session.0.clone(), (conn, tx_out.clone()));
 
     while let Some(Ok(raw)) = rx_ws.next().await {
         let Some(text) = split_text(raw) else {
@@ -215,6 +244,21 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                 let _ = tx_out.send(ServerMsg::RobotList { robots });
             }
             ClientMsg::Connect { robot } => {
+                // Re-Connect on the same session: tear down the prior session's
+                // robot link before opening the new one.
+                let prior = state.sessions.lock().await.robot_for(&session).cloned();
+                if let Some(prev_robot) = prior
+                    && prev_robot != robot
+                {
+                    relay_to(
+                        &state,
+                        &prev_robot.0,
+                        ServerMsg::ClientDisconnected {
+                            session: session.clone(),
+                        },
+                    )
+                    .await;
+                }
                 state
                     .sessions
                     .lock()
@@ -263,18 +307,45 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
         )
         .await;
     }
-    state.peers.lock().await.remove(&session.0);
+    // Remove this socket's own peers entry, but only if it still owns it.
+    let owned = state
+        .peers
+        .lock()
+        .await
+        .get(&session.0)
+        .is_some_and(|(c, _)| *c == conn);
+    if owned {
+        state.peers.lock().await.remove(&session.0);
+    }
     pump.abort();
 }
 
-/// Tiny unique-ish id without pulling in the uuid crate for the PoC.
+static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Nanos since epoch captured once, so ids are unique across process restarts too;
+/// falls back to 0 rather than panicking if the clock is somehow before the epoch.
+fn start_nanos() -> u128 {
+    static START: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *START.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    })
+}
+
+/// Unique-per-process id: process-start nanos plus a monotonic counter, so two
+/// connections in the same clock tick never collide.
 fn uuid_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{n:x}")
+    let n = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:x}-{n}", start_nanos())
+}
+
+/// Monotonic per-connection token, used to scope cleanup to the socket that
+/// owns a given peers/registry entry.
+fn next_conn_id() -> u64 {
+    CONN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 // Helper kept here so it is unit-testable.
