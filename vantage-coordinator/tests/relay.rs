@@ -14,7 +14,15 @@ use vantage_protocol::signalling::{ClientMsg, RobotInfo, RobotMsg, ServerMsg, Si
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn spawn_server() -> SocketAddr {
-    let state = Arc::new(AppState::with_config(Duration::from_secs(15), vec![]));
+    spawn_server_with_idle(Duration::from_secs(20)).await
+}
+
+async fn spawn_server_with_idle(idle_timeout: Duration) -> SocketAddr {
+    let state = Arc::new(AppState::with_config(
+        Duration::from_secs(15),
+        idle_timeout,
+        vec![],
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -425,4 +433,42 @@ async fn re_register_different_id_evicts_old() {
         }
         other => panic!("expected RobotList, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn robot_notified_when_silent_client_is_reaped() {
+    let addr = spawn_server_with_idle(Duration::from_millis(300)).await;
+    let (robot_ws, client_ws, session) = connected_pair(addr, "robot-1").await;
+
+    // The robot's own idle clock started at Register, before the client's clock
+    // started at Connect, so it must keep heartbeating (as a real robot would)
+    // or it would race the silent client to be reaped first. Only the client
+    // goes silent here.
+    let (mut robot_tx, mut robot_rx) = robot_ws.split();
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let txt = serde_json::to_string(&RobotMsg::Heartbeat).unwrap();
+            if robot_tx.send(Message::Text(txt)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), robot_rx.next())
+        .await
+        .expect("timed out waiting for message")
+        .expect("stream ended")
+        .expect("websocket error");
+    let msg: ServerMsg = match msg {
+        Message::Text(txt) => serde_json::from_str(&txt).unwrap(),
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    match msg {
+        ServerMsg::ClientDisconnected { session: s } => assert_eq!(s, session),
+        other => panic!("expected ClientDisconnected, got {other:?}"),
+    }
+
+    heartbeat.abort();
+    drop(client_ws);
 }

@@ -17,6 +17,10 @@ use crate::sessions::Sessions;
 /// One connected peer's outbound channel (robot or client).
 pub type Outbound = mpsc::UnboundedSender<ServerMsg>;
 
+/// A peer socket idle (no inbound frame) longer than this is treated as dead and
+/// reaped. Chosen well above the robot 5s heartbeat so a live robot never trips.
+const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub struct AppState {
     pub registry: Mutex<Registry>,
     pub sessions: Mutex<Sessions>,
@@ -25,6 +29,8 @@ pub struct AppState {
     /// tearing itself down, or was already replaced by a reconnect.
     pub peers: Mutex<std::collections::HashMap<String, (u64, Outbound)>>,
     pub ice_servers: Vec<IceServer>,
+    /// No inbound frame within this window on a peer socket ⇒ reap it.
+    pub idle_timeout: Duration,
 }
 
 impl AppState {
@@ -42,16 +48,19 @@ impl AppState {
             sessions: Mutex::new(Sessions::default()),
             peers: Mutex::new(std::collections::HashMap::new()),
             ice_servers: ice,
+            idle_timeout: PEER_IDLE_TIMEOUT,
         }
     }
 
-    /// Test/embedding constructor: explicit TTL, caller-supplied ICE servers, no environment reads.
-    pub fn with_config(ttl: Duration, ice_servers: Vec<IceServer>) -> Self {
+    /// Test/embedding constructor: explicit TTL, idle timeout, caller-supplied ICE
+    /// servers, no environment reads.
+    pub fn with_config(ttl: Duration, idle_timeout: Duration, ice_servers: Vec<IceServer>) -> Self {
         Self {
             registry: Mutex::new(Registry::new(ttl)),
             sessions: Mutex::new(Sessions::default()),
             peers: Mutex::new(std::collections::HashMap::new()),
             ice_servers,
+            idle_timeout,
         }
     }
 }
@@ -111,7 +120,15 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
 
     let mut my_id: Option<RobotId> = None;
 
-    while let Some(Ok(raw)) = rx_ws.next().await {
+    loop {
+        let raw = match tokio::time::timeout(state.idle_timeout, rx_ws.next()).await {
+            Err(_) => {
+                tracing::warn!("robot connection idle-timed-out; reaping");
+                break;
+            }
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(raw))) => raw,
+        };
         let Some(text) = split_text(raw) else {
             continue;
         };
@@ -226,7 +243,15 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
         .await
         .insert(session.0.clone(), (conn, tx_out.clone()));
 
-    while let Some(Ok(raw)) = rx_ws.next().await {
+    loop {
+        let raw = match tokio::time::timeout(state.idle_timeout, rx_ws.next()).await {
+            Err(_) => {
+                tracing::warn!("client {} idle-timed-out; reaping", session.0);
+                break;
+            }
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(raw))) => raw,
+        };
         let Some(text) = split_text(raw) else {
             continue;
         };
