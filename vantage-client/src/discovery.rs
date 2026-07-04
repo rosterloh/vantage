@@ -31,17 +31,17 @@ pub async fn discover(timeout: Duration) -> Result<Vec<Discovered>> {
         match tokio::time::timeout(remaining, receiver.recv_async()).await {
             Ok(Ok(ServiceEvent::ServiceResolved(info))) => {
                 let props: HashMap<String, String> = info
-                    .get_properties()
+                    .txt_properties
                     .iter()
                     .map(|p| (p.key().to_string(), p.val_str().to_string()))
                     .collect();
                 if let Some((id, name)) = robot_from_txt(&props)
-                    && let Some(ip) = info.get_addresses().iter().next()
+                    && let Some(ip) = info.addresses.iter().next()
                 {
                     found.push(Discovered {
                         id,
                         name,
-                        addr: SocketAddr::new(*ip, info.get_port()),
+                        addr: SocketAddr::new(ip.to_ip_addr(), info.port),
                     });
                 }
             }

@@ -14,5 +14,5 @@ anyhow.workspace = true
 tracing.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 dotenvy = "0.15"
