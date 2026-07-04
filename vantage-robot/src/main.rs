@@ -176,6 +176,10 @@ async fn main() -> Result<()> {
                     Ok(None) => { tracing::info!("coordinator closed"); break; }
                     Ok(Some(ServerMsg::ClientConnected { session: s })) => {
                         tracing::info!("client connected: {s}");
+                        if let Some(old) = consumers.remove(&s) {
+                            tracing::warn!("duplicate ClientConnected for {s}; replacing consumer");
+                            media.remove_consumer(old);
+                        }
                         let c = media.add_consumer(s.clone(), events_tx.clone())?;
                         watchdog.arm(s.clone(), std::time::Instant::now());
                         consumers.insert(s, c);

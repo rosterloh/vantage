@@ -46,7 +46,7 @@ pub struct Peer {
     pub webrtcbin: gst::Element,
     events_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerEvent>>,
     events_tx: mpsc::UnboundedSender<PeerEvent>,
-    data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
+    data_channel: Arc<std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>>,
     /// The operator→robot `control` channel, populated when the robot's control DC
     /// arrives via `on-data-channel` (shared with that closure, hence `Arc`).
     control_channel: Arc<std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>>,
@@ -80,7 +80,7 @@ impl Peer {
             webrtcbin,
             events_rx: tokio::sync::Mutex::new(rx),
             events_tx: tx.clone(),
-            data_channel: std::sync::Mutex::new(None),
+            data_channel: Arc::new(std::sync::Mutex::new(None)),
             control_channel: Arc::new(std::sync::Mutex::new(None)),
             frames_rx: tokio::sync::Mutex::new(frames_rx),
             frames_tx: frames_tx.clone(),
@@ -92,6 +92,7 @@ impl Peer {
 
         let tx2 = tx.clone();
         let control_slot = peer.control_channel.clone();
+        let data_slot = peer.data_channel.clone();
         peer.webrtcbin
             .connect("on-data-channel", false, move |vals| {
                 let dc = vals[1].get::<gst_webrtc::WebRTCDataChannel>().unwrap();
@@ -100,6 +101,7 @@ impl Peer {
                 if dc.property::<String>("label") == CONTROL_LABEL {
                     *control_slot.lock().unwrap() = Some(dc);
                 } else {
+                    *data_slot.lock().unwrap() = Some(dc.clone());
                     wire_data_channel(&dc, &tx2);
                 }
                 None
@@ -184,6 +186,11 @@ impl Peer {
             tracing::debug!("control channel not open yet; dropping {msg:?}");
         }
         Ok(())
+    }
+
+    /// Tear down the decode pipeline (sets it to Null).
+    pub fn shutdown(&self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 
