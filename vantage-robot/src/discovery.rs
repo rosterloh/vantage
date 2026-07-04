@@ -41,7 +41,8 @@ pub async fn serve_direct(media: Arc<RobotMedia>) -> Result<u16> {
                 }
                 Err(e) => {
                     tracing::warn!("direct accept failed: {e}");
-                    return;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
             }
         }
