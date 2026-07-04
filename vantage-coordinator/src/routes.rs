@@ -42,6 +42,16 @@ impl AppState {
             ice_servers: ice,
         }
     }
+
+    /// Test/embedding constructor: explicit TTL, caller-supplied ICE servers, no environment reads.
+    pub fn with_config(ttl: Duration, ice_servers: Vec<IceServer>) -> Self {
+        Self {
+            registry: Mutex::new(Registry::new(ttl)),
+            sessions: Mutex::new(Sessions::default()),
+            peers: Mutex::new(std::collections::HashMap::new()),
+            ice_servers,
+        }
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
