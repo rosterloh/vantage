@@ -142,6 +142,18 @@ async fn main() -> Result<()> {
     tracing::info!("registered as {id}");
     let mut consumers: HashMap<SessionId, Consumer> = HashMap::new();
 
+    // Outbound writes are pumped through a bounded channel by a dedicated task so a
+    // blocked coordinator socket write can never stall the select loop below (in
+    // particular the watchdog_tick arm, which must always fire on schedule).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RobotMsg>(64);
+    let pump = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if tx.send(&msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
     // Poll the failsafe often relative to CONTROL_TIMEOUT (500ms) so a stale session
@@ -182,9 +194,8 @@ async fn main() -> Result<()> {
             ev = events_rx.recv() => {
                 match ev {
                     Some((s, PeerEvent::LocalDescription(sig))) | Some((s, PeerEvent::LocalIce(sig))) => {
-                        if let Err(e) = tx.send(&RobotMsg::Signal { to: s, signal: sig }).await {
-                            tracing::warn!("coordinator send failed ({e}) — dropping coordinator link");
-                            break;
+                        if out_tx.try_send(RobotMsg::Signal { to: s.clone(), signal: sig }).is_err() {
+                            tracing::warn!("coordinator outbound full/closed — dropping signal for {s}");
                         }
                     }
                     Some((s, PeerEvent::DataChannelOpen)) => {
@@ -217,10 +228,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = heartbeat.tick() => {
-                if let Err(e) = tx.send(&RobotMsg::Heartbeat).await {
-                    tracing::warn!("coordinator send failed ({e}) — dropping coordinator link");
-                    break;
-                }
+                let _ = out_tx.try_send(RobotMsg::Heartbeat);
             }
             _ = telemetry_tick.tick() => {
                 let info = sampler.sample();
@@ -235,6 +243,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    pump.abort();
     for (s, c) in consumers.drain() {
         watchdog.disarm(&s);
         media.remove_consumer(c);
