@@ -24,6 +24,23 @@ pub fn selected_encoder_name() -> Option<&'static str> {
         .copied()
 }
 
+/// Unit the encoder's `bitrate` property expects. Most H.264 encoders take
+/// kbit/s; the Jetson V4L2 encoder takes bits/s. Mirror `configure_low_latency`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BitrateUnit {
+    Kbps,
+    Bps,
+}
+
+/// The unit the named encoder's `bitrate` property uses. Keep in lockstep with
+/// `configure_low_latency`.
+pub fn bitrate_unit(name: &str) -> BitrateUnit {
+    match name {
+        "nvv4l2h264enc" => BitrateUnit::Bps,
+        _ => BitrateUnit::Kbps,
+    }
+}
+
 /// Build the first available H.264 encoder, configured for low latency (~1.5 Mbit/s,
 /// ~1 s GOP at 30 fps, no B-frames). A downstream `h264parse` normalizes the output,
 /// so the caps contract to `rtph264pay` is identical regardless of which is selected.
@@ -104,5 +121,20 @@ mod tests {
             selected_encoder_name().is_some(),
             "expected at least x264enc"
         );
+    }
+
+    #[test]
+    fn bitrate_units_match_configure_low_latency() {
+        assert_eq!(bitrate_unit("nvv4l2h264enc"), BitrateUnit::Bps);
+        for k in [
+            "x264enc",
+            "nvh264enc",
+            "vah264enc",
+            "vaapih264enc",
+            "qsvh264enc",
+            "vtenc_h264",
+        ] {
+            assert_eq!(bitrate_unit(k), BitrateUnit::Kbps, "{k} should be kbit/s");
+        }
     }
 }

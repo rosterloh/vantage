@@ -206,6 +206,11 @@ impl RobotMedia {
         // is confirmed present. On this host rtpgccbwe is absent → log once, skip.
         if gst::ElementFactory::find("rtpgccbwe").is_some() {
             let enc_weak = self.enc.downgrade();
+            let unit = self
+                .enc
+                .factory()
+                .map(|f| crate::encoder::bitrate_unit(f.name().as_str()))
+                .unwrap_or(crate::encoder::BitrateUnit::Kbps);
             webrtcbin.connect("request-aux-sender", false, move |_vals| {
                 let gcc = match gst::ElementFactory::make("rtpgccbwe").build() {
                     Ok(g) => g,
@@ -226,11 +231,17 @@ impl RobotMedia {
                 gcc.connect("notify::estimated-bitrate", false, move |args| {
                     let gcc_el = args[0].get::<gst::Element>().ok()?;
                     let bps: u32 = gcc_el.property("estimated-bitrate");
-                    // x264enc bitrate is in kbit/s; clamp to 300–2500 kbit/s.
+                    // Clamp to 300–2500 kbit/s, then scale to the encoder's unit.
                     let kbps = (bps / 1000).clamp(300, 2500);
+                    let value = match unit {
+                        crate::encoder::BitrateUnit::Kbps => kbps,
+                        crate::encoder::BitrateUnit::Bps => kbps.saturating_mul(1000),
+                    };
                     if let Some(enc) = enc_weak.upgrade() {
-                        enc.set_property("bitrate", kbps);
-                        tracing::debug!("adaptive bitrate: {kbps} kbit/s (estimate {bps} bit/s)");
+                        enc.set_property("bitrate", value);
+                        tracing::debug!(
+                            "adaptive bitrate: {value} ({unit:?}) from estimate {bps} bit/s"
+                        );
                     }
                     None
                 });
