@@ -1,10 +1,6 @@
-mod registry;
-mod routes;
-mod sessions;
-
 use std::sync::Arc;
 
-use routes::{AppState, router};
+use vantage_coordinator::{AppState, router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
