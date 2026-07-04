@@ -129,7 +129,10 @@ async fn main() -> Result<()> {
             tracing::warn!(
                 "coordinator unreachable ({e}) — serving LAN clients via mDNS/direct only"
             );
-            return std::future::pending::<Result<()>>().await;
+            shutdown_signal().await;
+            tracing::info!("shutdown signal received (LAN-only mode)");
+            media.shutdown();
+            return Ok(());
         }
     };
     let (mut tx, mut rx) = ws.split();
@@ -137,7 +140,10 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "coordinator registration failed ({e}) — serving LAN clients via mDNS/direct only"
         );
-        return std::future::pending::<Result<()>>().await;
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received (LAN-only mode)");
+        media.shutdown();
+        return Ok(());
     }
     tracing::info!("registered as {id}");
     let mut consumers: HashMap<SessionId, Consumer> = HashMap::new();
@@ -160,6 +166,7 @@ async fn main() -> Result<()> {
     // trips promptly.
     let mut watchdog_tick = tokio::time::interval(Duration::from_millis(100));
 
+    let mut received_shutdown = false;
     loop {
         tokio::select! {
             // Coordinator -> robot
@@ -240,6 +247,11 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal received");
+                received_shutdown = true;
+                break;
+            }
         }
     }
 
@@ -248,8 +260,29 @@ async fn main() -> Result<()> {
         watchdog.disarm(&s);
         media.remove_consumer(c);
     }
-    tracing::warn!("coordinator link lost — continuing to serve LAN clients via mDNS/direct");
-    std::future::pending::<Result<()>>().await
+    if !received_shutdown {
+        tracing::warn!("coordinator link lost — continuing to serve LAN clients via mDNS/direct");
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received (LAN-only mode)");
+    }
+    media.shutdown();
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }
 
 /// Act on a live teleop command. The PoC has no actuator, so "acting" means logging

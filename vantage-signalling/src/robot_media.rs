@@ -331,6 +331,11 @@ impl RobotMedia {
     pub async fn recv_raw_frame(&self) -> Option<RawFrame> {
         self.raw_frames_rx.lock().await.recv().await
     }
+
+    /// Set the pipeline to Null, releasing the camera device and encoder threads.
+    pub fn shutdown(&self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
 }
 
 /// One connected client: a `webrtcbin` fed by a `queue` tapped off `rtptee`, plus
