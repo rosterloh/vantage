@@ -110,7 +110,7 @@ async fn run_answer_loop(
         .build();
 
     // Frame pump: decoded frames -> UI.
-    {
+    let pump = {
         let peer = peer.clone();
         let ui = ui.clone();
         let frames_rx = frames_rx.clone();
@@ -119,8 +119,8 @@ async fn run_answer_loop(
                 frames_rx.add(1, &[]);
                 ui.frame(frame);
             }
-        });
-    }
+        })
+    };
 
     let mut control_closed = false;
     loop {
@@ -159,6 +159,8 @@ async fn run_answer_loop(
             }
         }
     }
+    pump.abort();
+    peer.shutdown();
     Ok(())
 }
 

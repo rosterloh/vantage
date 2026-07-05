@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("ros publish failed: {e}"),
                 }
             }
+            tracing::warn!("raw-frame drain task exited");
         });
     }
     #[cfg(not(feature = "ros"))]
@@ -108,6 +109,7 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            tracing::warn!("raw-frame drain task exited");
         });
     }
 
@@ -129,13 +131,36 @@ async fn main() -> Result<()> {
             tracing::warn!(
                 "coordinator unreachable ({e}) — serving LAN clients via mDNS/direct only"
             );
-            return std::future::pending::<Result<()>>().await;
+            shutdown_signal().await;
+            tracing::info!("shutdown signal received (LAN-only mode)");
+            media.shutdown();
+            return Ok(());
         }
     };
     let (mut tx, mut rx) = ws.split();
-    tx.send(&RobotMsg::Register(robot_info.clone())).await?;
+    if let Err(e) = tx.send(&RobotMsg::Register(robot_info.clone())).await {
+        tracing::warn!(
+            "coordinator registration failed ({e}) — serving LAN clients via mDNS/direct only"
+        );
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received (LAN-only mode)");
+        media.shutdown();
+        return Ok(());
+    }
     tracing::info!("registered as {id}");
     let mut consumers: HashMap<SessionId, Consumer> = HashMap::new();
+
+    // Outbound writes are pumped through a bounded channel by a dedicated task so a
+    // blocked coordinator socket write can never stall the select loop below (in
+    // particular the watchdog_tick arm, which must always fire on schedule).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RobotMsg>(64);
+    let pump = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if tx.send(&msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
@@ -143,19 +168,25 @@ async fn main() -> Result<()> {
     // trips promptly.
     let mut watchdog_tick = tokio::time::interval(Duration::from_millis(100));
 
+    let mut received_shutdown = false;
     loop {
         tokio::select! {
             // Coordinator -> robot
             msg = rx.recv::<ServerMsg>() => {
-                match msg? {
-                    None => { tracing::info!("coordinator closed"); break; }
-                    Some(ServerMsg::ClientConnected { session: s }) => {
+                match msg {
+                    Err(e) => { tracing::warn!("bad frame from coordinator ({e})"); break; }
+                    Ok(None) => { tracing::info!("coordinator closed"); break; }
+                    Ok(Some(ServerMsg::ClientConnected { session: s })) => {
                         tracing::info!("client connected: {s}");
+                        if let Some(old) = consumers.remove(&s) {
+                            tracing::warn!("duplicate ClientConnected for {s}; replacing consumer");
+                            media.remove_consumer(old);
+                        }
                         let c = media.add_consumer(s.clone(), events_tx.clone())?;
                         watchdog.arm(s.clone(), std::time::Instant::now());
                         consumers.insert(s, c);
                     }
-                    Some(ServerMsg::ClientDisconnected { session: s }) => {
+                    Ok(Some(ServerMsg::ClientDisconnected { session: s })) => {
                         tracing::info!("client disconnected: {s}");
                         if let Some(c) = consumers.remove(&s) {
                             media.remove_consumer(c);
@@ -164,19 +195,21 @@ async fn main() -> Result<()> {
                         tracing::warn!("safe-state entered: {s} (disconnect)");
                         dc_open.remove(&s);
                     }
-                    Some(ServerMsg::Signal { from: Some(s), signal }) => {
+                    Ok(Some(ServerMsg::Signal { from: Some(s), signal })) => {
                         if let Some(c) = consumers.get(&s) { c.handle_signal(signal)?; }
                     }
-                    Some(ServerMsg::Signal { from: None, .. }) => {}
-                    Some(ServerMsg::Error { message }) => tracing::warn!("coordinator error: {message}"),
-                    _ => {}
+                    Ok(Some(ServerMsg::Signal { from: None, .. })) => {}
+                    Ok(Some(ServerMsg::Error { message })) => tracing::warn!("coordinator error: {message}"),
+                    Ok(_) => {}
                 }
             }
             // Consumers -> coordinator / local  (merged, session-tagged)
             ev = events_rx.recv() => {
                 match ev {
                     Some((s, PeerEvent::LocalDescription(sig))) | Some((s, PeerEvent::LocalIce(sig))) => {
-                        tx.send(&RobotMsg::Signal { to: s, signal: sig }).await?;
+                        if out_tx.try_send(RobotMsg::Signal { to: s.clone(), signal: sig }).is_err() {
+                            tracing::warn!("coordinator outbound full/closed — dropping signal for {s}");
+                        }
                     }
                     Some((s, PeerEvent::DataChannelOpen)) => {
                         tracing::info!("data channel open: {s}");
@@ -208,7 +241,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = heartbeat.tick() => {
-                tx.send(&RobotMsg::Heartbeat).await?;
+                let _ = out_tx.try_send(RobotMsg::Heartbeat);
             }
             _ = telemetry_tick.tick() => {
                 let info = sampler.sample();
@@ -220,9 +253,42 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal received");
+                received_shutdown = true;
+                break;
+            }
         }
     }
+
+    pump.abort();
+    for (s, c) in consumers.drain() {
+        watchdog.disarm(&s);
+        media.remove_consumer(c);
+    }
+    if !received_shutdown {
+        tracing::warn!("coordinator link lost — continuing to serve LAN clients via mDNS/direct");
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received (LAN-only mode)");
+    }
+    media.shutdown();
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }
 
 /// Act on a live teleop command. The PoC has no actuator, so "acting" means logging

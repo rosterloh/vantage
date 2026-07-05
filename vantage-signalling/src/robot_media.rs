@@ -148,7 +148,7 @@ impl RobotMedia {
         // Per-consumer channel; a forwarder tags each event with the session id and
         // pushes it onto the shared loop channel.
         let (tx, mut rx) = mpsc::unbounded_channel::<PeerEvent>();
-        {
+        let forwarder = {
             let events_tx = events_tx.clone();
             let session = session.clone();
             tokio::spawn(async move {
@@ -157,8 +157,8 @@ impl RobotMedia {
                         break;
                     }
                 }
-            });
-        }
+            })
+        };
 
         let webrtcbin = gst::ElementFactory::make("webrtcbin")
             .name(format!("wrb-{}", session.0))
@@ -206,6 +206,11 @@ impl RobotMedia {
         // is confirmed present. On this host rtpgccbwe is absent → log once, skip.
         if gst::ElementFactory::find("rtpgccbwe").is_some() {
             let enc_weak = self.enc.downgrade();
+            let unit = self
+                .enc
+                .factory()
+                .map(|f| crate::encoder::bitrate_unit(f.name().as_str()))
+                .unwrap_or(crate::encoder::BitrateUnit::Kbps);
             webrtcbin.connect("request-aux-sender", false, move |_vals| {
                 let gcc = match gst::ElementFactory::make("rtpgccbwe").build() {
                     Ok(g) => g,
@@ -226,11 +231,17 @@ impl RobotMedia {
                 gcc.connect("notify::estimated-bitrate", false, move |args| {
                     let gcc_el = args[0].get::<gst::Element>().ok()?;
                     let bps: u32 = gcc_el.property("estimated-bitrate");
-                    // x264enc bitrate is in kbit/s; clamp to 300–2500 kbit/s.
+                    // Clamp to 300–2500 kbit/s, then scale to the encoder's unit.
                     let kbps = (bps / 1000).clamp(300, 2500);
+                    let value = match unit {
+                        crate::encoder::BitrateUnit::Kbps => kbps,
+                        crate::encoder::BitrateUnit::Bps => kbps.saturating_mul(1000),
+                    };
                     if let Some(enc) = enc_weak.upgrade() {
-                        enc.set_property("bitrate", kbps);
-                        tracing::debug!("adaptive bitrate: {kbps} kbit/s (estimate {bps} bit/s)");
+                        enc.set_property("bitrate", value);
+                        tracing::debug!(
+                            "adaptive bitrate: {value} ({unit:?}) from estimate {bps} bit/s"
+                        );
                     }
                     None
                 });
@@ -291,6 +302,7 @@ impl RobotMedia {
             queue,
             rtptee_pad,
             data_channel: std::sync::Mutex::new(Some(dc)),
+            forwarder,
         })
     }
 
@@ -303,15 +315,18 @@ impl RobotMedia {
             webrtcbin,
             queue,
             rtptee_pad,
+            forwarder,
             ..
         } = consumer;
         tracing::info!("removing consumer {session}");
+        forwarder.abort();
         let pipeline = self.pipeline.clone();
         let rtptee = self.rtptee.clone();
 
         rtptee_pad
             .clone()
             .add_probe(gst::PadProbeType::IDLE, move |pad, _info| {
+                tracing::debug!("consumer teardown probe fired");
                 // 1. unlink rtptee → queue
                 if let Some(qsink) = queue.static_pad("sink") {
                     let _ = pad.unlink(&qsink);
@@ -331,6 +346,11 @@ impl RobotMedia {
     pub async fn recv_raw_frame(&self) -> Option<RawFrame> {
         self.raw_frames_rx.lock().await.recv().await
     }
+
+    /// Set the pipeline to Null, releasing the camera device and encoder threads.
+    pub fn shutdown(&self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
 }
 
 /// One connected client: a `webrtcbin` fed by a `queue` tapped off `rtptee`, plus
@@ -342,6 +362,7 @@ pub struct Consumer {
     queue: gst::Element,
     rtptee_pad: gst::Pad,
     data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
+    forwarder: tokio::task::JoinHandle<()>,
 }
 
 /// Options for the `control` data channel: unreliable + unordered so a lost or late
@@ -520,5 +541,22 @@ mod tests {
             }
             other => panic!("expected an Offer, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_consumer_twice_same_session_then_remove_is_clean() {
+        let media = RobotMedia::new(&ice()).expect("robot media builds");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionId("s".into());
+
+        let c1 = media
+            .add_consumer(session.clone(), tx.clone())
+            .expect("first consumer builds");
+        media.remove_consumer(c1);
+
+        let c2 = media
+            .add_consumer(session, tx)
+            .expect("second consumer builds");
+        media.remove_consumer(c2);
     }
 }

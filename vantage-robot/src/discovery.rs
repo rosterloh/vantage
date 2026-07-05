@@ -41,7 +41,8 @@ pub async fn serve_direct(media: Arc<RobotMedia>) -> Result<u16> {
                 }
                 Err(e) => {
                     tracing::warn!("direct accept failed: {e}");
-                    return;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
             }
         }
@@ -84,6 +85,18 @@ async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStr
     let (events_tx, mut events_rx) =
         tokio::sync::mpsc::unbounded_channel::<(SessionId, PeerEvent)>();
 
+    // Outbound writes are pumped through a bounded channel by a dedicated task so a
+    // blocked peer socket write can never stall the select loop below (in particular
+    // the watchdog_tick arm, which must always fire on schedule).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ServerMsg>(64);
+    let pump = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if tx.send(&msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // Creating the consumer builds the offer and both data channels immediately.
     let consumer = media.add_consumer(session.clone(), events_tx)?;
     let mut watchdog = Watchdog::default();
@@ -106,7 +119,9 @@ async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStr
             ev = events_rx.recv() => {
                 match ev {
                     Some((_, PeerEvent::LocalDescription(sig))) | Some((_, PeerEvent::LocalIce(sig))) => {
-                        tx.send(&ServerMsg::Signal { from: None, signal: sig }).await?;
+                        if out_tx.try_send(ServerMsg::Signal { from: None, signal: sig }).is_err() {
+                            tracing::warn!("direct peer outbound full/closed — dropping signal for {session}");
+                        }
                     }
                     Some((_, PeerEvent::DataChannelOpen)) => { dc_open = true; }
                     Some((s, PeerEvent::Control(bytes))) => {
@@ -135,6 +150,7 @@ async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStr
         }
     }
 
+    pump.abort();
     watchdog.disarm(&session);
     media.remove_consumer(consumer);
     tracing::warn!("safe-state entered: {session} (disconnect)");
