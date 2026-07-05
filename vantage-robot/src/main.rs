@@ -182,7 +182,10 @@ async fn main() -> Result<()> {
                             tracing::warn!("duplicate ClientConnected for {s}; replacing consumer");
                             media.remove_consumer(old);
                         }
-                        let c = media.add_consumer(s.clone(), events_tx.clone())?;
+                        let c = match media.add_consumer(s.clone(), events_tx.clone()) {
+                            Ok(c) => c,
+                            Err(e) => { tracing::warn!("failed to add consumer for {s}: {e}"); continue; }
+                        };
                         watchdog.arm(s.clone(), std::time::Instant::now());
                         consumers.insert(s, c);
                     }
@@ -196,7 +199,11 @@ async fn main() -> Result<()> {
                         dc_open.remove(&s);
                     }
                     Ok(Some(ServerMsg::Signal { from: Some(s), signal })) => {
-                        if let Some(c) = consumers.get(&s) { c.handle_signal(signal)?; }
+                        if let Some(c) = consumers.get(&s)
+                            && let Err(e) = c.handle_signal(signal)
+                        {
+                            tracing::warn!("failed to apply signal for {s}: {e}");
+                        }
                     }
                     Ok(Some(ServerMsg::Signal { from: None, .. })) => {}
                     Ok(Some(ServerMsg::Error { message })) => tracing::warn!("coordinator error: {message}"),
@@ -246,11 +253,17 @@ async fn main() -> Result<()> {
             _ = telemetry_tick.tick() => {
                 let info = sampler.sample();
                 metrics.record_device(&info);
-                let bytes = codec::encode(&info)?;
-                for (s, c) in &consumers {
-                    if dc_open.contains(s) {
-                        c.send_data(&bytes)?;
+                match codec::encode(&info) {
+                    Ok(bytes) => {
+                        for (s, c) in &consumers {
+                            if dc_open.contains(s)
+                                && let Err(e) = c.send_data(&bytes)
+                            {
+                                tracing::warn!("telemetry send failed for {s}: {e}");
+                            }
+                        }
                     }
+                    Err(e) => tracing::warn!("telemetry encode failed: {e}"),
                 }
             }
             _ = shutdown_signal() => {
