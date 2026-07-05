@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("ros publish failed: {e}"),
                 }
             }
+            tracing::warn!("raw-frame drain task exited");
         });
     }
     #[cfg(not(feature = "ros"))]
@@ -108,6 +109,7 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            tracing::warn!("raw-frame drain task exited");
         });
     }
 

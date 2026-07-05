@@ -133,18 +133,27 @@ impl Peer {
                 let promise = gst::Promise::with_change_func(move |reply| {
                     let reply = match reply {
                         Ok(Some(r)) => r,
-                        _ => return,
+                        _ => {
+                            tracing::error!("create-answer produced no reply");
+                            return;
+                        }
                     };
-                    let answer = reply
+                    let Some(answer) = reply
                         .value("answer")
-                        .unwrap()
-                        .get::<gst_webrtc::WebRTCSessionDescription>()
-                        .unwrap();
+                        .ok()
+                        .and_then(|v| v.get::<gst_webrtc::WebRTCSessionDescription>().ok())
+                    else {
+                        tracing::error!("create-answer reply missing a valid answer");
+                        return;
+                    };
                     bin.emit_by_name::<()>(
                         "set-local-description",
                         &[&answer, &None::<gst::Promise>],
                     );
-                    let sdp = answer.sdp().as_text().unwrap();
+                    let Some(sdp) = answer.sdp().as_text().ok() else {
+                        tracing::error!("answer SDP not serialisable");
+                        return;
+                    };
                     let _ = tx.send(PeerEvent::LocalDescription(Signal::Answer { sdp }));
                 });
                 self.webrtcbin
@@ -287,15 +296,24 @@ pub(crate) fn wire_on_negotiation_needed(
         let promise = gst::Promise::with_change_func(move |reply| {
             let reply = match reply {
                 Ok(Some(r)) => r,
-                _ => return,
+                _ => {
+                    tracing::error!("create-offer produced no reply");
+                    return;
+                }
             };
-            let offer = reply
+            let Some(offer) = reply
                 .value("offer")
-                .unwrap()
-                .get::<gst_webrtc::WebRTCSessionDescription>()
-                .unwrap();
+                .ok()
+                .and_then(|v| v.get::<gst_webrtc::WebRTCSessionDescription>().ok())
+            else {
+                tracing::error!("create-offer reply missing a valid offer");
+                return;
+            };
             bin2.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
-            let sdp = offer.sdp().as_text().unwrap();
+            let Some(sdp) = offer.sdp().as_text().ok() else {
+                tracing::error!("offer SDP not serialisable");
+                return;
+            };
             let _ = tx2.send(PeerEvent::LocalDescription(Signal::Offer { sdp }));
         });
         bin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
