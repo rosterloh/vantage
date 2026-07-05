@@ -127,7 +127,12 @@ async fn run_answer_loop(
         tokio::select! {
             msg = rx.recv::<ServerMsg>() => {
                 match msg? {
-                    Some(ServerMsg::Signal { signal, .. }) => { peer.handle_signal(signal)?; }
+                    Some(ServerMsg::Signal { signal, .. }) => {
+                        if let Err(e) = peer.handle_signal(signal) {
+                            ui.status(&format!("signal error: {e}"));
+                            tracing::warn!("failed to apply signal: {e}");
+                        }
+                    }
                     Some(ServerMsg::Error { message }) => ui.status(&format!("error: {message}")),
                     Some(_) => {}
                     None => { ui.status("connection closed"); break; }
@@ -153,7 +158,11 @@ async fn run_answer_loop(
             // Operator input (keyboard / headless stub) -> robot control channel.
             cmd = control_rx.recv(), if !control_closed => {
                 match cmd {
-                    Some(msg) => peer.send_control(&msg)?,
+                    Some(msg) => {
+                        if let Err(e) = peer.send_control(&msg) {
+                            tracing::warn!("control send failed: {e}");
+                        }
+                    }
                     None => control_closed = true,
                 }
             }
