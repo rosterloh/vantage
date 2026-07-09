@@ -25,7 +25,7 @@ futures-util = "0.3"
 dotenvy = "0.15"
 
 [dev-dependencies]
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 vantage-protocol = { path = "../vantage-protocol" }
 serde_json.workspace = true
