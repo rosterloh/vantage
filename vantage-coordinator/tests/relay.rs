@@ -472,3 +472,96 @@ async fn robot_notified_when_silent_client_is_reaped() {
     heartbeat.abort();
     drop(client_ws);
 }
+
+const TEST_TOKEN: &str = "test-token-123";
+
+async fn spawn_server_with_auth() -> SocketAddr {
+    let state = Arc::new(
+        AppState::with_config(Duration::from_secs(15), Duration::from_secs(20), vec![])
+            .with_auth(TEST_TOKEN),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+    addr
+}
+
+async fn connect_with_token(addr: SocketAddr, path: &str, token: &str) -> Ws {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}{path}").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (ws, _) = connect_async(req).await.unwrap();
+    ws
+}
+
+#[tokio::test]
+async fn ws_without_token_is_rejected_when_auth_configured() {
+    let addr = spawn_server_with_auth().await;
+    let err = connect_async(format!("ws://{addr}/ws/robot"))
+        .await
+        .unwrap_err();
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 401),
+        other => panic!("expected HTTP 401 rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ws_with_wrong_token_is_rejected() {
+    let addr = spawn_server_with_auth().await;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/ws/robot")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer wrong-token".parse().unwrap());
+    let err = connect_async(req).await.unwrap_err();
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 401),
+        other => panic!("expected HTTP 401 rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ws_with_token_registers_and_lists() {
+    let addr = spawn_server_with_auth().await;
+    let mut robot_ws = connect_with_token(addr, "/ws/robot", TEST_TOKEN).await;
+    send_json(&mut robot_ws, &RobotMsg::Register(robot_info("robot-1"))).await;
+
+    let mut client_ws = connect_with_token(addr, "/ws/client", TEST_TOKEN).await;
+    send_json(&mut client_ws, &ClientMsg::ListRobots).await;
+    let msg: ServerMsg = recv_json(&mut client_ws).await;
+    match msg {
+        ServerMsg::RobotList { robots } => {
+            assert!(robots.iter().any(|r| r.id == RobotId("robot-1".into())));
+        }
+        other => panic!("expected RobotList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ice_requires_token_when_configured() {
+    let addr = spawn_server_with_auth().await;
+    let http = reqwest::Client::new();
+    let resp = http.get(format!("http://{addr}/ice")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    let resp = http
+        .get(format!("http://{addr}/ice"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn healthz_stays_open_with_auth_configured() {
+    let addr = spawn_server_with_auth().await;
+    let resp = reqwest::get(format!("http://{addr}/healthz"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}

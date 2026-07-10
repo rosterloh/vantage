@@ -31,6 +31,8 @@ pub struct AppState {
     pub ice_servers: Vec<IceServer>,
     /// No inbound frame within this window on a peer socket ⇒ reap it.
     pub idle_timeout: Duration,
+    /// When set, every route except /healthz requires `Authorization: Bearer <token>`.
+    pub auth_token: Option<String>,
 }
 
 impl AppState {
@@ -43,12 +45,20 @@ impl AppState {
                 credential: std::env::var("VANTAGE_TURN_PASS").ok(),
             });
         }
+        let auth_token = std::env::var("VANTAGE_COORDINATOR_TOKEN").ok();
+        if auth_token.is_none() {
+            tracing::warn!(
+                "VANTAGE_COORDINATOR_TOKEN not set — coordinator is UNAUTHENTICATED: \
+                 any peer can register, enumerate robots, and fetch TURN credentials"
+            );
+        }
         Self {
             registry: Mutex::new(Registry::new(Duration::from_secs(15))),
             sessions: Mutex::new(Sessions::default()),
             peers: Mutex::new(std::collections::HashMap::new()),
             ice_servers: ice,
             idle_timeout: PEER_IDLE_TIMEOUT,
+            auth_token,
         }
     }
 
@@ -61,18 +71,57 @@ impl AppState {
             peers: Mutex::new(std::collections::HashMap::new()),
             ice_servers,
             idle_timeout,
+            auth_token: None,
         }
+    }
+
+    /// Enable bearer-token auth on all routes except /healthz.
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
     }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+    let protected = Router::new()
         .route("/ice", get(ice_servers))
         .route("/stats", get(stats))
         .route("/ws/robot", get(robot_ws))
         .route("/ws/client", get(client_ws))
-        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ))
+        .with_state(state);
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(protected)
+}
+
+async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(expected) = &state.auth_token else {
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+            next.run(req).await
+        }
+        _ => axum::http::StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Comparison time must not depend on where the first mismatching byte is.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn ice_servers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
