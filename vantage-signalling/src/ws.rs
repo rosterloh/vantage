@@ -22,7 +22,14 @@ pub struct CoordinatorWsRx {
 
 impl CoordinatorWs {
     pub async fn connect(url: &str) -> Result<Self> {
-        let (inner, _resp) = connect_async(url).await?;
+        Self::connect_with_token(url, None).await
+    }
+
+    /// Connect presenting `Authorization: Bearer <token>` when a token is given
+    /// (the coordinator's VANTAGE_COORDINATOR_TOKEN). None connects plain — for
+    /// open coordinators and the direct LAN path.
+    pub async fn connect_with_token(url: &str, token: Option<&str>) -> Result<Self> {
+        let (inner, _resp) = connect_async(auth_request(url, token)?).await?;
         Ok(Self { inner })
     }
 
@@ -46,6 +53,24 @@ impl CoordinatorWs {
         let (sink, stream) = self.inner.split();
         (CoordinatorWsTx { sink }, CoordinatorWsRx { stream })
     }
+}
+
+fn auth_request(
+    url: &str,
+    token: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request()?;
+    if let Some(t) = token {
+        let value = format!("Bearer {t}")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("token is not header-safe: {e}"))?;
+        req.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+            value,
+        );
+    }
+    Ok(req)
 }
 
 impl CoordinatorWsTx {
@@ -109,5 +134,22 @@ impl PeerWsRx {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_request_carries_bearer_header() {
+        let req = auth_request("ws://localhost:8080/ws/robot", Some("tok")).unwrap();
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer tok");
+    }
+
+    #[test]
+    fn auth_request_without_token_has_no_header() {
+        let req = auth_request("ws://localhost:8080/ws/robot", None).unwrap();
+        assert!(req.headers().get("authorization").is_none());
     }
 }
