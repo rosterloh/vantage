@@ -21,6 +21,9 @@ pub type Outbound = mpsc::UnboundedSender<ServerMsg>;
 /// reaped. Chosen well above the robot 5s heartbeat so a live robot never trips.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Signalling messages are small (an SDP is a few KB); anything bigger is abuse.
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
 pub struct AppState {
     pub registry: Mutex<Registry>,
     pub sessions: Mutex<Sessions>,
@@ -144,11 +147,15 @@ async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn robot_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| crate::routes::handle_robot(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| crate::routes::handle_robot(socket, state))
 }
 
 async fn client_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| crate::routes::handle_client(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| crate::routes::handle_client(socket, state))
 }
 
 #[tracing::instrument(skip_all)]

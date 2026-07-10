@@ -565,3 +565,32 @@ async fn healthz_stays_open_with_auth_configured() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 }
+
+#[tokio::test]
+async fn oversized_message_gets_the_peer_disconnected() {
+    let addr = spawn_server().await;
+    let mut robot_ws = connect(addr, "/ws/robot").await;
+    send_json(&mut robot_ws, &RobotMsg::Register(robot_info("robot-1"))).await;
+
+    let huge = "x".repeat(128 * 1024);
+    robot_ws.send(Message::Text(huge)).await.unwrap();
+
+    let end = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match robot_ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(
+        end.is_ok(),
+        "connection must terminate after an oversized message"
+    );
+
+    // The coordinator itself must stay healthy for other peers.
+    let mut client_ws = connect(addr, "/ws/client").await;
+    send_json(&mut client_ws, &ClientMsg::ListRobots).await;
+    let _: ServerMsg = recv_json(&mut client_ws).await;
+}
