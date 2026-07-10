@@ -14,8 +14,18 @@ use vantage_protocol::{FleetStats, RobotId, SessionId};
 use crate::registry::Registry;
 use crate::sessions::Sessions;
 
-/// One connected peer's outbound channel (robot or client).
-pub type Outbound = mpsc::UnboundedSender<ServerMsg>;
+/// One connected peer's outbound channel (robot or client). Bounded: a peer this
+/// far behind is not reading its socket, so further messages to it are dropped
+/// (the idle timeout reaps it) instead of growing coordinator memory.
+pub type Outbound = mpsc::Sender<ServerMsg>;
+
+const OUTBOUND_QUEUE_DEPTH: usize = 256;
+
+fn send_or_drop(out: &Outbound, msg: ServerMsg) {
+    if let Err(mpsc::error::TrySendError::Full(_)) = out.try_send(msg) {
+        tracing::warn!("peer outbound queue full — dropping message (slow reader)");
+    }
+}
 
 /// A peer socket idle (no inbound frame) longer than this is treated as dead and
 /// reaped. Chosen well above the robot 5s heartbeat so a live robot never trips.
@@ -162,7 +172,7 @@ async fn client_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> 
 pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
     let conn = next_conn_id();
     let (mut tx_ws, mut rx_ws) = socket.split();
-    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();
+    let (tx_out, mut rx_out) = mpsc::channel::<ServerMsg>(OUTBOUND_QUEUE_DEPTH);
 
     // Pump outbound ServerMsgs to the websocket.
     let pump = tokio::spawn(async move {
@@ -189,9 +199,12 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
             continue;
         };
         let Ok(msg) = serde_json::from_str::<RobotMsg>(&text) else {
-            let _ = tx_out.send(ServerMsg::Error {
-                message: "bad robot message".into(),
-            });
+            send_or_drop(
+                &tx_out,
+                ServerMsg::Error {
+                    message: "bad robot message".into(),
+                },
+            );
             continue;
         };
         match msg {
@@ -272,7 +285,7 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
 
 async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
     if let Some((_, out)) = state.peers.lock().await.get(peer_key) {
-        let _ = out.send(msg);
+        send_or_drop(out, msg);
     }
 }
 
@@ -280,7 +293,7 @@ async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
 pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
     let conn = next_conn_id();
     let (mut tx_ws, mut rx_ws) = socket.split();
-    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();
+    let (tx_out, mut rx_out) = mpsc::channel::<ServerMsg>(OUTBOUND_QUEUE_DEPTH);
 
     let pump = tokio::spawn(async move {
         while let Some(msg) = rx_out.recv().await {
@@ -312,9 +325,12 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
             continue;
         };
         let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) else {
-            let _ = tx_out.send(ServerMsg::Error {
-                message: "bad client message".into(),
-            });
+            send_or_drop(
+                &tx_out,
+                ServerMsg::Error {
+                    message: "bad client message".into(),
+                },
+            );
             continue;
         };
         match msg {
@@ -322,7 +338,7 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                 let mut reg = state.registry.lock().await;
                 reg.prune(std::time::Instant::now());
                 let robots = reg.list();
-                let _ = tx_out.send(ServerMsg::RobotList { robots });
+                send_or_drop(&tx_out, ServerMsg::RobotList { robots });
             }
             ClientMsg::Connect { robot } => {
                 // Re-Connect on the same session: tear down the prior session's
@@ -354,10 +370,13 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                     },
                 )
                 .await;
-                let _ = tx_out.send(ServerMsg::Connected {
-                    robot,
-                    session: session.clone(),
-                });
+                send_or_drop(
+                    &tx_out,
+                    ServerMsg::Connected {
+                        robot,
+                        session: session.clone(),
+                    },
+                );
             }
             ClientMsg::Signal { signal } => {
                 // Route to the robot of this session, tagging our session id.

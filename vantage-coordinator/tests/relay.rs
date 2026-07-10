@@ -594,3 +594,41 @@ async fn oversized_message_gets_the_peer_disconnected() {
     send_json(&mut client_ws, &ClientMsg::ListRobots).await;
     let _: ServerMsg = recv_json(&mut client_ws).await;
 }
+
+#[tokio::test]
+async fn flooding_a_stalled_client_does_not_wedge_the_coordinator() {
+    let addr = spawn_server().await;
+    let (mut robot_ws, client_ws, session) = connected_pair(addr, "robot-1").await;
+
+    // client_ws is never read again; large payloads defeat kernel socket buffering
+    // so the coordinator-side outbound queue for this peer genuinely fills.
+    let fat_sdp = "x".repeat(32 * 1024);
+    for _ in 0..600 {
+        send_json(
+            &mut robot_ws,
+            &RobotMsg::Signal {
+                to: session.clone(),
+                signal: Signal::Offer {
+                    sdp: fat_sdp.clone(),
+                },
+            },
+        )
+        .await;
+    }
+
+    // A second, healthy pair must still relay correctly.
+    let (mut robot2, mut client2, session2) = connected_pair(addr, "robot-2").await;
+    send_json(
+        &mut client2,
+        &ClientMsg::Signal {
+            signal: Signal::Offer { sdp: "o".into() },
+        },
+    )
+    .await;
+    let msg: ServerMsg = recv_json(&mut robot2).await;
+    match msg {
+        ServerMsg::Signal { from, .. } => assert_eq!(from, Some(session2)),
+        other => panic!("expected Signal, got {other:?}"),
+    }
+    drop(client_ws);
+}
