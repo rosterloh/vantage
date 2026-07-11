@@ -16,14 +16,16 @@ use crate::sessions::Sessions;
 
 /// One connected peer's outbound channel (robot or client). Bounded: a peer this
 /// far behind is not reading its socket, so further messages to it are dropped
-/// (the idle timeout reaps it) instead of growing coordinator memory.
+/// instead of growing coordinator memory. (A peer that also stops SENDING is
+/// reaped by the idle timeout; one that keeps sending while not reading just
+/// keeps dropping.)
 pub type Outbound = mpsc::Sender<ServerMsg>;
 
 const OUTBOUND_QUEUE_DEPTH: usize = 256;
 
-fn send_or_drop(out: &Outbound, msg: ServerMsg) {
+fn send_or_drop(peer: &str, out: &Outbound, msg: ServerMsg) {
     if let Err(mpsc::error::TrySendError::Full(_)) = out.try_send(msg) {
-        tracing::warn!("peer outbound queue full — dropping message (slow reader)");
+        tracing::warn!("outbound queue full for {peer} — dropping message (slow reader)");
     }
 }
 
@@ -108,6 +110,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             require_auth,
         ))
         .with_state(state);
+    // Outer router is UNAUTHENTICATED — new routes belong on `protected` above
+    // unless they are deliberately public like /healthz.
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(protected)
@@ -202,6 +206,10 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
         };
         let Ok(msg) = serde_json::from_str::<RobotMsg>(&text) else {
             send_or_drop(
+                my_id
+                    .as_ref()
+                    .map(|i| i.0.as_str())
+                    .unwrap_or("unregistered robot"),
                 &tx_out,
                 ServerMsg::Error {
                     message: "bad robot message".into(),
@@ -287,7 +295,7 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
 
 async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
     if let Some((_, out)) = state.peers.lock().await.get(peer_key) {
-        send_or_drop(out, msg);
+        send_or_drop(peer_key, out, msg);
     }
 }
 
@@ -328,6 +336,7 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
         };
         let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) else {
             send_or_drop(
+                &session.0,
                 &tx_out,
                 ServerMsg::Error {
                     message: "bad client message".into(),
@@ -340,7 +349,7 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                 let mut reg = state.registry.lock().await;
                 reg.prune(std::time::Instant::now());
                 let robots = reg.list();
-                send_or_drop(&tx_out, ServerMsg::RobotList { robots });
+                send_or_drop(&session.0, &tx_out, ServerMsg::RobotList { robots });
             }
             ClientMsg::Connect { robot } => {
                 // Re-Connect on the same session: tear down the prior session's
@@ -373,6 +382,7 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                 )
                 .await;
                 send_or_drop(
+                    &session.0,
                     &tx_out,
                     ServerMsg::Connected {
                         robot,
