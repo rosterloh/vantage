@@ -35,7 +35,7 @@ impl CoordinatorWs {
 
     pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
         let txt = serde_json::to_string(msg)?;
-        self.inner.send(Message::Text(txt)).await?;
+        self.inner.send(Message::Text(txt.into())).await?;
         Ok(())
     }
 
@@ -76,7 +76,7 @@ fn auth_request(
 impl CoordinatorWsTx {
     pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
         let txt = serde_json::to_string(msg)?;
-        self.sink.send(Message::Text(txt)).await?;
+        self.sink.send(Message::Text(txt.into())).await?;
         Ok(())
     }
 }
@@ -121,7 +121,7 @@ impl PeerWs {
 impl PeerWsTx {
     pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
         let txt = serde_json::to_string(msg)?;
-        self.sink.send(Message::Text(txt)).await?;
+        self.sink.send(Message::Text(txt.into())).await?;
         Ok(())
     }
 }
