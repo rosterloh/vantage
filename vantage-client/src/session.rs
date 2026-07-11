@@ -26,10 +26,13 @@ pub async fn run_session(
     ui: Arc<dyn UiSink>,
     control_rx: mpsc::UnboundedReceiver<ControlMsg>,
 ) -> Result<()> {
+    let token = std::env::var("VANTAGE_COORDINATOR_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     // Primary path: the coordinator. If it is unreachable, fall back to the mDNS
     // LAN fast path (offline direct connect).
-    match CoordinatorWs::connect(&format!("{coord}/ws/client")).await {
-        Ok(ws) => run_via_coordinator(coord, ws, ui, control_rx).await,
+    match CoordinatorWs::connect_with_token(&format!("{coord}/ws/client"), token.as_deref()).await {
+        Ok(ws) => run_via_coordinator(coord, token, ws, ui, control_rx).await,
         Err(e) => {
             ui.status(&format!("coordinator unreachable ({e}); scanning LAN…"));
             tracing::warn!("coordinator unreachable ({e}) — trying mDNS LAN fast path");
@@ -41,6 +44,7 @@ pub async fn run_session(
 /// Coordinator path: discover via the robot list, then connect.
 async fn run_via_coordinator(
     coord: String,
+    token: Option<String>,
     mut ws: CoordinatorWs,
     ui: Arc<dyn UiSink>,
     control_rx: mpsc::UnboundedReceiver<ControlMsg>,
@@ -63,7 +67,7 @@ async fn run_via_coordinator(
     })
     .await?;
 
-    let ice = fetch_ice(&coord).await?;
+    let ice = fetch_ice(&coord, token.as_deref()).await?;
     let peer = Arc::new(Peer::new(&ice)?);
     let (tx, rx) = ws.split();
     run_answer_loop(peer, tx, rx, ui, control_rx).await
@@ -173,10 +177,16 @@ async fn run_answer_loop(
     Ok(())
 }
 
-async fn fetch_ice(coord: &str) -> Result<Vec<IceServer>> {
+async fn fetch_ice(coord: &str, token: Option<&str>) -> Result<Vec<IceServer>> {
     let http = coord.replacen("ws", "http", 1);
-    let servers = reqwest::get(format!("{http}/ice"))
+    let mut req = reqwest::Client::new().get(format!("{http}/ice"));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let servers = req
+        .send()
         .await?
+        .error_for_status()?
         .json::<Vec<IceServer>>()
         .await?;
     Ok(servers)

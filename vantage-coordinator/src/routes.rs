@@ -14,12 +14,25 @@ use vantage_protocol::{FleetStats, RobotId, SessionId};
 use crate::registry::Registry;
 use crate::sessions::Sessions;
 
-/// One connected peer's outbound channel (robot or client).
-pub type Outbound = mpsc::UnboundedSender<ServerMsg>;
+/// One connected peer's outbound channel (robot or client). Bounded: a peer this
+/// far behind is not reading its socket, so further messages to it are dropped
+/// (the idle timeout reaps it) instead of growing coordinator memory.
+pub type Outbound = mpsc::Sender<ServerMsg>;
+
+const OUTBOUND_QUEUE_DEPTH: usize = 256;
+
+fn send_or_drop(out: &Outbound, msg: ServerMsg) {
+    if let Err(mpsc::error::TrySendError::Full(_)) = out.try_send(msg) {
+        tracing::warn!("peer outbound queue full — dropping message (slow reader)");
+    }
+}
 
 /// A peer socket idle (no inbound frame) longer than this is treated as dead and
 /// reaped. Chosen well above the robot 5s heartbeat so a live robot never trips.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Signalling messages are small (an SDP is a few KB); anything bigger is abuse.
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
 
 pub struct AppState {
     pub registry: Mutex<Registry>,
@@ -31,6 +44,8 @@ pub struct AppState {
     pub ice_servers: Vec<IceServer>,
     /// No inbound frame within this window on a peer socket ⇒ reap it.
     pub idle_timeout: Duration,
+    /// When set, every route except /healthz requires `Authorization: Bearer <token>`.
+    pub auth_token: Option<String>,
 }
 
 impl AppState {
@@ -43,12 +58,22 @@ impl AppState {
                 credential: std::env::var("VANTAGE_TURN_PASS").ok(),
             });
         }
+        let auth_token = std::env::var("VANTAGE_COORDINATOR_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        if auth_token.is_none() {
+            tracing::warn!(
+                "VANTAGE_COORDINATOR_TOKEN not set — coordinator is UNAUTHENTICATED: \
+                 any peer can register, enumerate robots, and fetch TURN credentials"
+            );
+        }
         Self {
             registry: Mutex::new(Registry::new(Duration::from_secs(15))),
             sessions: Mutex::new(Sessions::default()),
             peers: Mutex::new(std::collections::HashMap::new()),
             ice_servers: ice,
             idle_timeout: PEER_IDLE_TIMEOUT,
+            auth_token,
         }
     }
 
@@ -61,18 +86,57 @@ impl AppState {
             peers: Mutex::new(std::collections::HashMap::new()),
             ice_servers,
             idle_timeout,
+            auth_token: None,
         }
+    }
+
+    /// Enable bearer-token auth on all routes except /healthz.
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
     }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+    let protected = Router::new()
         .route("/ice", get(ice_servers))
         .route("/stats", get(stats))
         .route("/ws/robot", get(robot_ws))
         .route("/ws/client", get(client_ws))
-        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ))
+        .with_state(state);
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(protected)
+}
+
+async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(expected) = &state.auth_token else {
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+            next.run(req).await
+        }
+        _ => axum::http::StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Comparison time must not depend on where the first mismatching byte is.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn ice_servers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -95,18 +159,22 @@ async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn robot_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| crate::routes::handle_robot(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| crate::routes::handle_robot(socket, state))
 }
 
 async fn client_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| crate::routes::handle_client(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| crate::routes::handle_client(socket, state))
 }
 
 #[tracing::instrument(skip_all)]
 pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
     let conn = next_conn_id();
     let (mut tx_ws, mut rx_ws) = socket.split();
-    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();
+    let (tx_out, mut rx_out) = mpsc::channel::<ServerMsg>(OUTBOUND_QUEUE_DEPTH);
 
     // Pump outbound ServerMsgs to the websocket.
     let pump = tokio::spawn(async move {
@@ -133,9 +201,12 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
             continue;
         };
         let Ok(msg) = serde_json::from_str::<RobotMsg>(&text) else {
-            let _ = tx_out.send(ServerMsg::Error {
-                message: "bad robot message".into(),
-            });
+            send_or_drop(
+                &tx_out,
+                ServerMsg::Error {
+                    message: "bad robot message".into(),
+                },
+            );
             continue;
         };
         match msg {
@@ -216,7 +287,7 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
 
 async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
     if let Some((_, out)) = state.peers.lock().await.get(peer_key) {
-        let _ = out.send(msg);
+        send_or_drop(out, msg);
     }
 }
 
@@ -224,7 +295,7 @@ async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
 pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
     let conn = next_conn_id();
     let (mut tx_ws, mut rx_ws) = socket.split();
-    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<ServerMsg>();
+    let (tx_out, mut rx_out) = mpsc::channel::<ServerMsg>(OUTBOUND_QUEUE_DEPTH);
 
     let pump = tokio::spawn(async move {
         while let Some(msg) = rx_out.recv().await {
@@ -256,9 +327,12 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
             continue;
         };
         let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) else {
-            let _ = tx_out.send(ServerMsg::Error {
-                message: "bad client message".into(),
-            });
+            send_or_drop(
+                &tx_out,
+                ServerMsg::Error {
+                    message: "bad client message".into(),
+                },
+            );
             continue;
         };
         match msg {
@@ -266,7 +340,7 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                 let mut reg = state.registry.lock().await;
                 reg.prune(std::time::Instant::now());
                 let robots = reg.list();
-                let _ = tx_out.send(ServerMsg::RobotList { robots });
+                send_or_drop(&tx_out, ServerMsg::RobotList { robots });
             }
             ClientMsg::Connect { robot } => {
                 // Re-Connect on the same session: tear down the prior session's
@@ -298,10 +372,13 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                     },
                 )
                 .await;
-                let _ = tx_out.send(ServerMsg::Connected {
-                    robot,
-                    session: session.clone(),
-                });
+                send_or_drop(
+                    &tx_out,
+                    ServerMsg::Connected {
+                        robot,
+                        session: session.clone(),
+                    },
+                );
             }
             ClientMsg::Signal { signal } => {
                 // Route to the robot of this session, tagging our session id.

@@ -32,13 +32,18 @@ async fn main() -> Result<()> {
     let coord =
         std::env::var("VANTAGE_COORDINATOR").unwrap_or_else(|_| "ws://localhost:8080".into());
     let id = RobotId(std::env::var("VANTAGE_ROBOT_ID").unwrap_or_else(|_| "robot-1".into()));
+    let token = std::env::var("VANTAGE_COORDINATOR_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
 
     // ICE is fetched from the coordinator, but on the offline LAN path the coordinator
     // is unreachable — fall back to STUN-only (host candidates carry the LAN).
-    let ice = fetch_ice(&coord).await.unwrap_or_else(|e| {
-        tracing::warn!("ICE fetch failed ({e}) — using STUN-only defaults (LAN/direct path)");
-        default_ice()
-    });
+    let ice = fetch_ice(&coord, token.as_deref())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("ICE fetch failed ({e}) — using STUN-only defaults (LAN/direct path)");
+            default_ice()
+        });
     let robot_info = RobotInfo {
         id: id.clone(),
         name: std::env::var("VANTAGE_ROBOT_NAME").unwrap_or_else(|_| "Atlas".into()),
@@ -125,7 +130,9 @@ async fn main() -> Result<()> {
     };
 
     // Coordinator path (primary). If unreachable, keep running to serve LAN clients.
-    let ws = match CoordinatorWs::connect(&format!("{coord}/ws/robot")).await {
+    let ws = match CoordinatorWs::connect_with_token(&format!("{coord}/ws/robot"), token.as_deref())
+        .await
+    {
         Ok(ws) => ws,
         Err(e) => {
             tracing::warn!(
@@ -317,10 +324,16 @@ fn act_on_control(session: &SessionId, msg: vantage_protocol::ControlMsg) {
     }
 }
 
-async fn fetch_ice(coord: &str) -> Result<Vec<IceServer>> {
+async fn fetch_ice(coord: &str, token: Option<&str>) -> Result<Vec<IceServer>> {
     let http = coord.replacen("ws", "http", 1); // ws://host -> http://host, wss:// -> https://
-    let servers = reqwest::get(format!("{http}/ice"))
+    let mut req = reqwest::Client::new().get(format!("{http}/ice"));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let servers = req
+        .send()
         .await?
+        .error_for_status()?
         .json::<Vec<IceServer>>()
         .await?;
     Ok(servers)
