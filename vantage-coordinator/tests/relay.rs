@@ -632,3 +632,59 @@ async fn flooding_a_stalled_client_does_not_wedge_the_coordinator() {
     }
     drop(client_ws);
 }
+
+#[tokio::test]
+async fn pinging_client_is_not_reaped() {
+    let addr = spawn_server_with_idle(Duration::from_millis(300)).await;
+    let (robot_ws, mut client_ws, _session) = connected_pair(addr, "robot-1").await;
+
+    // Keep the robot alive exactly as robot_notified_when_silent_client_is_reaped does.
+    let (mut robot_tx, mut robot_rx) = robot_ws.split();
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let txt = serde_json::to_string(&RobotMsg::Heartbeat).unwrap();
+            if robot_tx.send(Message::Text(txt.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The client sends ONLY WS pings — no text frames — across 3+ idle windows.
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client_ws.send(Message::Ping(vec![].into())).await.unwrap();
+    }
+
+    // Still alive: a ListRobots round trip works. The server may have queued Pong
+    // frames for our pings — skip non-Text frames while waiting for the reply.
+    send_json(&mut client_ws, &ClientMsg::ListRobots).await;
+    let reply = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match client_ws.next().await {
+                Some(Ok(Message::Text(txt))) => {
+                    break serde_json::from_str::<ServerMsg>(&txt).unwrap();
+                }
+                Some(Ok(_)) => continue, // Pong etc.
+                other => panic!("client socket ended unexpectedly: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for RobotList");
+    match reply {
+        ServerMsg::RobotList { robots } => {
+            assert!(robots.iter().any(|r| r.id == RobotId("robot-1".into())));
+        }
+        other => panic!("expected RobotList, got {other:?}"),
+    }
+
+    // And the robot must NOT have been told the client disconnected.
+    let nothing = tokio::time::timeout(Duration::from_millis(300), robot_rx.next()).await;
+    assert!(
+        nothing.is_err(),
+        "robot unexpectedly received a message (ClientDisconnected?) for a pinging client"
+    );
+
+    heartbeat.abort();
+}
