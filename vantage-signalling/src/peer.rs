@@ -41,6 +41,32 @@ pub struct RawFrame {
     pub data: Vec<u8>,    // tightly packed, width*height*3 bytes
 }
 
+/// Frames waiting for a consumer are ~1 MB each, so the queue must stay small and
+/// bounded; when the consumer stalls, new frames are dropped until it drains.
+#[allow(dead_code)]
+pub(crate) const FRAME_QUEUE_DEPTH: usize = 4;
+
+/// Push a frame from a GStreamer streaming thread — must never block. Returns
+/// whether the frame was queued; drops are counted and logged every 100th.
+#[allow(dead_code)]
+pub(crate) fn try_push_frame<T>(
+    tx: &mpsc::Sender<T>,
+    frame: T,
+    dropped: &std::sync::atomic::AtomicU64,
+) -> bool {
+    match tx.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(100) {
+                tracing::warn!("frame consumer stalled — {n} frames dropped so far");
+            }
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
 pub struct Peer {
     pub pipeline: gst::Pipeline,
     pub webrtcbin: gst::Element,
@@ -409,6 +435,27 @@ fn build_decode_branch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_push_frame_drops_on_full_and_counts() {
+        let (tx, mut rx) = mpsc::channel::<u32>(2);
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        assert!(try_push_frame(&tx, 1, &dropped));
+        assert!(try_push_frame(&tx, 2, &dropped));
+        assert!(!try_push_frame(&tx, 3, &dropped)); // full → dropped
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap(), 1); // drop-newest: 1 and 2 survive
+        assert!(try_push_frame(&tx, 4, &dropped)); // space again after a recv
+    }
+
+    #[test]
+    fn try_push_frame_is_silent_false_on_closed() {
+        let (tx, rx) = mpsc::channel::<u32>(2);
+        drop(rx);
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        assert!(!try_push_frame(&tx, 1, &dropped));
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn peer_is_send_sync() {
