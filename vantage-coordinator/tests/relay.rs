@@ -38,7 +38,7 @@ async fn connect(addr: SocketAddr, path: &str) -> Ws {
 
 async fn send_json(ws: &mut Ws, msg: &impl serde::Serialize) {
     let txt = serde_json::to_string(msg).unwrap();
-    ws.send(Message::Text(txt)).await.unwrap();
+    ws.send(Message::Text(txt.into())).await.unwrap();
 }
 
 async fn recv_json<T: DeserializeOwned>(ws: &mut Ws) -> T {
@@ -449,7 +449,7 @@ async fn robot_notified_when_silent_client_is_reaped() {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let txt = serde_json::to_string(&RobotMsg::Heartbeat).unwrap();
-            if robot_tx.send(Message::Text(txt)).await.is_err() {
+            if robot_tx.send(Message::Text(txt.into())).await.is_err() {
                 break;
             }
         }
@@ -573,7 +573,7 @@ async fn oversized_message_gets_the_peer_disconnected() {
     send_json(&mut robot_ws, &RobotMsg::Register(robot_info("robot-1"))).await;
 
     let huge = "x".repeat(128 * 1024);
-    robot_ws.send(Message::Text(huge)).await.unwrap();
+    robot_ws.send(Message::Text(huge.into())).await.unwrap();
 
     let end = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
