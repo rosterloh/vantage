@@ -73,6 +73,69 @@ impl Watchdog {
     }
 }
 
+/// A command whose estimated queueing delay exceeds this (beyond the session's
+/// best-observed path delay) is too old to act on and is dropped.
+pub const STALE_LIMIT: Duration = Duration::from_millis(500);
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Admit {
+    Fresh,
+    /// seq did not advance: a reordered or duplicated datagram.
+    OutOfOrder,
+    /// Estimated age beyond STALE_LIMIT: arrived, but too late to act on.
+    Stale,
+}
+
+/// Per-session admission gate for `ControlEnvelope`s. Age is estimated without
+/// clock sync: the minimum observed spread (arrival − sent) approximates clock
+/// offset + best-case path delay, so spread − min_spread approximates extra
+/// queueing delay. The first envelope of a session is Fresh and seeds the baseline.
+#[derive(Default)]
+pub struct Freshness {
+    sessions: HashMap<SessionId, SessionFreshness>,
+}
+
+struct SessionFreshness {
+    last_seq: u64,
+    min_spread_ms: i128,
+}
+
+impl Freshness {
+    pub fn admit(&mut self, session: &SessionId, seq: u64, sent_ms: u64, arrival_ms: u64) -> Admit {
+        let spread = arrival_ms as i128 - sent_ms as i128;
+        match self.sessions.get_mut(session) {
+            None => {
+                self.sessions.insert(
+                    session.clone(),
+                    SessionFreshness {
+                        last_seq: seq,
+                        min_spread_ms: spread,
+                    },
+                );
+                Admit::Fresh
+            }
+            Some(st) => {
+                if seq <= st.last_seq {
+                    return Admit::OutOfOrder;
+                }
+                st.last_seq = seq;
+                if spread < st.min_spread_ms {
+                    st.min_spread_ms = spread;
+                }
+                if spread - st.min_spread_ms > STALE_LIMIT.as_millis() as i128 {
+                    Admit::Stale
+                } else {
+                    Admit::Fresh
+                }
+            }
+        }
+    }
+
+    pub fn forget(&mut self, session: &SessionId) {
+        self.sessions.remove(session);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +188,76 @@ mod tests {
         w.disarm(&sess());
         assert!(!w.is_live(&sess()));
         assert!(w.tick(t0 + Duration::from_secs(10)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    fn sess() -> SessionId {
+        SessionId("s1".into())
+    }
+
+    #[test]
+    fn first_envelope_is_fresh_and_seeds_the_baseline() {
+        let mut f = Freshness::default();
+        assert_eq!(f.admit(&sess(), 1, 0, 1000), Admit::Fresh);
+    }
+
+    #[test]
+    fn advancing_seq_with_steady_delay_stays_fresh() {
+        let mut f = Freshness::default();
+        f.admit(&sess(), 1, 0, 20);
+        assert_eq!(f.admit(&sess(), 2, 100, 125), Admit::Fresh);
+        assert_eq!(f.admit(&sess(), 3, 200, 218), Admit::Fresh);
+    }
+
+    #[test]
+    fn reordered_or_duplicate_seq_is_rejected() {
+        let mut f = Freshness::default();
+        f.admit(&sess(), 5, 0, 10);
+        assert_eq!(f.admit(&sess(), 5, 0, 20), Admit::OutOfOrder);
+        assert_eq!(f.admit(&sess(), 4, 0, 30), Admit::OutOfOrder);
+    }
+
+    #[test]
+    fn command_delayed_beyond_stale_limit_is_stale() {
+        let mut f = Freshness::default();
+        f.admit(&sess(), 1, 0, 10); // baseline spread 10ms
+        // sent at 100, arrives at 700: spread 600, est. age 590 > STALE_LIMIT
+        assert_eq!(f.admit(&sess(), 2, 100, 700), Admit::Stale);
+    }
+
+    #[test]
+    fn baseline_tightens_when_a_faster_path_is_observed() {
+        let mut f = Freshness::default();
+        f.admit(&sess(), 1, 0, 300); // pessimistic first baseline (spread 300)
+        assert_eq!(f.admit(&sess(), 2, 100, 150), Admit::Fresh); // spread 50 tightens it
+        // spread 600 → est. age 550 against the tightened baseline → stale
+        assert_eq!(f.admit(&sess(), 3, 200, 800), Admit::Stale);
+    }
+
+    #[test]
+    fn stale_envelope_does_not_block_the_next_fresh_one() {
+        let mut f = Freshness::default();
+        f.admit(&sess(), 1, 0, 10);
+        assert_eq!(f.admit(&sess(), 2, 100, 700), Admit::Stale);
+        assert_eq!(f.admit(&sess(), 3, 700, 715), Admit::Fresh);
+    }
+
+    #[test]
+    fn forget_resets_the_session() {
+        let mut f = Freshness::default();
+        f.admit(&sess(), 9, 0, 10);
+        f.forget(&sess());
+        assert_eq!(f.admit(&sess(), 1, 0, 10), Admit::Fresh);
+    }
+
+    #[test]
+    fn sessions_are_independent() {
+        let mut f = Freshness::default();
+        f.admit(&SessionId("a".into()), 9, 0, 10);
+        assert_eq!(f.admit(&SessionId("b".into()), 1, 0, 10), Admit::Fresh);
     }
 }
