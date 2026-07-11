@@ -9,7 +9,7 @@ use gstreamer_video::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use vantage_protocol::control::{CONTROL_LABEL, ControlMsg};
+use vantage_protocol::control::{CONTROL_LABEL, ControlEnvelope, ControlMsg};
 use vantage_protocol::signalling::{IceServer, Signal};
 
 #[derive(Debug)]
@@ -76,6 +76,8 @@ pub struct Peer {
     control_channel: Arc<std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>>,
     frames_rx: tokio::sync::Mutex<mpsc::Receiver<VideoFrame>>,
     frames_tx: mpsc::Sender<VideoFrame>,
+    control_seq: std::sync::atomic::AtomicU64,
+    control_epoch: std::time::Instant,
 }
 
 impl Peer {
@@ -108,6 +110,8 @@ impl Peer {
             control_channel: Arc::new(std::sync::Mutex::new(None)),
             frames_rx: tokio::sync::Mutex::new(frames_rx),
             frames_tx: frames_tx.clone(),
+            control_seq: std::sync::atomic::AtomicU64::new(0),
+            control_epoch: std::time::Instant::now(),
         };
 
         // The SCTP transport is only available once the pipeline is PLAYING; the decode
@@ -208,11 +212,13 @@ impl Peer {
         Ok(())
     }
 
-    /// Send a teleop command on the operator→robot `control` channel. No-op (with a
-    /// debug log) until the control channel has arrived and opened.
+    /// Send a teleop command on the operator→robot `control` channel, wrapped in a
+    /// seq+timestamp envelope so the robot can reject reordered/stale commands.
+    /// No-op (with a debug log) until the control channel has arrived and opened.
     pub fn send_control(&self, msg: &ControlMsg) -> Result<()> {
         if let Some(dc) = self.control_channel.lock().unwrap().as_ref() {
-            let bytes = vantage_protocol::codec::encode(msg)?;
+            let env = next_envelope(&self.control_seq, self.control_epoch, *msg);
+            let bytes = vantage_protocol::codec::encode(&env)?;
             let glib_bytes = glib::Bytes::from(&bytes);
             dc.emit_by_name::<()>("send-data", &[&glib_bytes]);
         } else {
@@ -435,6 +441,18 @@ fn build_decode_branch(
     Ok(())
 }
 
+fn next_envelope(
+    seq: &std::sync::atomic::AtomicU64,
+    epoch: std::time::Instant,
+    msg: ControlMsg,
+) -> ControlEnvelope {
+    ControlEnvelope {
+        seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        sent_ms: epoch.elapsed().as_millis() as u64,
+        msg,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +482,16 @@ mod tests {
     fn peer_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Peer>();
+    }
+
+    #[test]
+    fn next_envelope_stamps_strictly_increasing_seq() {
+        let seq = std::sync::atomic::AtomicU64::new(0);
+        let epoch = std::time::Instant::now();
+        let a = next_envelope(&seq, epoch, ControlMsg::KeepAlive);
+        let b = next_envelope(&seq, epoch, ControlMsg::KeepAlive);
+        assert_eq!(a.seq, 1);
+        assert_eq!(b.seq, 2);
+        assert!(b.sent_ms >= a.sent_ms);
     }
 }
