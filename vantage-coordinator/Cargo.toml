@@ -30,4 +30,4 @@ futures-util = "0.3"
 vantage-protocol = { path = "../vantage-protocol" }
 serde_json.workspace = true
 tokio.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }

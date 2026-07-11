@@ -14,7 +14,7 @@ tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sysinfo = "0.33"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 mdns-sd.workspace = true
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
