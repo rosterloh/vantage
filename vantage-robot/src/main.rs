@@ -32,7 +32,9 @@ async fn main() -> Result<()> {
     let coord =
         std::env::var("VANTAGE_COORDINATOR").unwrap_or_else(|_| "ws://localhost:8080".into());
     let id = RobotId(std::env::var("VANTAGE_ROBOT_ID").unwrap_or_else(|_| "robot-1".into()));
-    let token = std::env::var("VANTAGE_COORDINATOR_TOKEN").ok();
+    let token = std::env::var("VANTAGE_COORDINATOR_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
 
     // ICE is fetched from the coordinator, but on the offline LAN path the coordinator
     // is unreachable — fall back to STUN-only (host candidates carry the LAN).

@@ -26,7 +26,9 @@ pub async fn run_session(
     ui: Arc<dyn UiSink>,
     control_rx: mpsc::UnboundedReceiver<ControlMsg>,
 ) -> Result<()> {
-    let token = std::env::var("VANTAGE_COORDINATOR_TOKEN").ok();
+    let token = std::env::var("VANTAGE_COORDINATOR_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     // Primary path: the coordinator. If it is unreachable, fall back to the mDNS
     // LAN fast path (offline direct connect).
     match CoordinatorWs::connect_with_token(&format!("{coord}/ws/client"), token.as_deref()).await {

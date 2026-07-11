@@ -58,7 +58,9 @@ impl AppState {
                 credential: std::env::var("VANTAGE_TURN_PASS").ok(),
             });
         }
-        let auth_token = std::env::var("VANTAGE_COORDINATOR_TOKEN").ok();
+        let auth_token = std::env::var("VANTAGE_COORDINATOR_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
         if auth_token.is_none() {
             tracing::warn!(
                 "VANTAGE_COORDINATOR_TOKEN not set — coordinator is UNAUTHENTICATED: \
