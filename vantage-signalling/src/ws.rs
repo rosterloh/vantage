@@ -79,6 +79,14 @@ impl CoordinatorWsTx {
         self.sink.send(Message::Text(txt.into())).await?;
         Ok(())
     }
+
+    /// WS-level keepalive: after negotiation the media flows peer-to-peer and no
+    /// signalling is sent, so this is the only traffic keeping the coordinator's
+    /// idle reaper (20s) from dropping a healthy client.
+    pub async fn send_ping(&mut self) -> Result<()> {
+        self.sink.send(Message::Ping(vec![].into())).await?;
+        Ok(())
+    }
 }
 
 impl CoordinatorWsRx {

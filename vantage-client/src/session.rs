@@ -12,6 +12,10 @@ use std::time::Duration;
 
 use crate::discovery;
 
+/// Must stay well under the coordinator's 20s peer idle timeout; 5s matches the
+/// robot's heartbeat cadence.
+const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Where the session pushes decoded frames, telemetry, and status. Implementations
 /// are the headless logger (Task 3) and the Slint UI bridge (Task 4).
 pub trait UiSink: Send + Sync + 'static {
@@ -127,6 +131,7 @@ async fn run_answer_loop(
     };
 
     let mut control_closed = false;
+    let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
     loop {
         tokio::select! {
             msg = rx.recv::<ServerMsg>() => {
@@ -168,6 +173,11 @@ async fn run_answer_loop(
                         }
                     }
                     None => control_closed = true,
+                }
+            }
+            _ = keepalive.tick() => {
+                if let Err(e) = tx.send_ping().await {
+                    tracing::warn!("ws keepalive failed: {e}");
                 }
             }
         }
