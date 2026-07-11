@@ -43,12 +43,10 @@ pub struct RawFrame {
 
 /// Frames waiting for a consumer are ~1 MB each, so the queue must stay small and
 /// bounded; when the consumer stalls, new frames are dropped until it drains.
-#[allow(dead_code)]
 pub(crate) const FRAME_QUEUE_DEPTH: usize = 4;
 
 /// Push a frame from a GStreamer streaming thread — must never block. Returns
 /// whether the frame was queued; drops are counted and logged every 100th.
-#[allow(dead_code)]
 pub(crate) fn try_push_frame<T>(
     tx: &mpsc::Sender<T>,
     frame: T,
@@ -76,8 +74,8 @@ pub struct Peer {
     /// The operator→robot `control` channel, populated when the robot's control DC
     /// arrives via `on-data-channel` (shared with that closure, hence `Arc`).
     control_channel: Arc<std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>>,
-    frames_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<VideoFrame>>,
-    frames_tx: mpsc::UnboundedSender<VideoFrame>,
+    frames_rx: tokio::sync::Mutex<mpsc::Receiver<VideoFrame>>,
+    frames_tx: mpsc::Sender<VideoFrame>,
 }
 
 impl Peer {
@@ -99,7 +97,7 @@ impl Peer {
 
         wire_local_ice(&webrtcbin, &tx);
 
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel::<VideoFrame>();
+        let (frames_tx, frames_rx) = mpsc::channel::<VideoFrame>(FRAME_QUEUE_DEPTH);
 
         let peer = Self {
             pipeline,
@@ -351,7 +349,7 @@ pub(crate) fn wire_on_negotiation_needed(
 fn wire_video_receiver(
     pipeline: &gst::Pipeline,
     webrtcbin: &gst::Element,
-    frames_tx: &mpsc::UnboundedSender<VideoFrame>,
+    frames_tx: &mpsc::Sender<VideoFrame>,
 ) {
     let pipeline = pipeline.clone();
     let frames_tx = frames_tx.clone();
@@ -368,7 +366,7 @@ fn wire_video_receiver(
 fn build_decode_branch(
     pipeline: &gst::Pipeline,
     src_pad: &gst::Pad,
-    frames_tx: &mpsc::UnboundedSender<VideoFrame>,
+    frames_tx: &mpsc::Sender<VideoFrame>,
 ) -> Result<()> {
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
     let parse = gst::ElementFactory::make("h264parse").build()?;
@@ -387,6 +385,7 @@ fn build_decode_branch(
 
     {
         let frames_tx = frames_tx.clone();
+        let dropped = std::sync::atomic::AtomicU64::new(0);
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -408,11 +407,15 @@ fn build_decode_branch(
                         let start = row * stride;
                         rgba.extend_from_slice(&src[start..start + width * 4]);
                     }
-                    let _ = frames_tx.send(VideoFrame {
-                        width: width as u32,
-                        height: height as u32,
-                        rgba,
-                    });
+                    try_push_frame(
+                        &frames_tx,
+                        VideoFrame {
+                            width: width as u32,
+                            height: height as u32,
+                            rgba,
+                        },
+                        &dropped,
+                    );
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
