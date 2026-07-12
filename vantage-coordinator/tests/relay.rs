@@ -181,8 +181,10 @@ async fn robot_disconnect_notifies_attached_client() {
 
     let msg: ServerMsg = recv_json(&mut client_ws).await;
     match msg {
-        ServerMsg::Error { message } => assert_eq!(message, "robot disconnected"),
-        other => panic!("expected Error, got {other:?}"),
+        ServerMsg::RobotDisconnected { robot } => {
+            assert_eq!(robot, RobotId("robot-1".into()));
+        }
+        other => panic!("expected RobotDisconnected, got {other:?}"),
     }
 }
 

@@ -86,6 +86,9 @@ pub enum ServerMsg {
     ClientDisconnected { session: SessionId },
     /// Sent to a client once its Connect is accepted.
     Connected { robot: RobotId, session: SessionId },
+    /// Sent to a client when the robot of its session disconnects. The session is
+    /// already closed coordinator-side; the client should end its loop, not linger.
+    RobotDisconnected { robot: RobotId },
     /// ICE servers for either peer.
     IceServers { servers: Vec<IceServer> },
     /// Relayed signalling. `from` is the peer session for the robot side.
@@ -142,6 +145,19 @@ mod tests {
         assert!(
             !json.contains("username"),
             "STUN entry must not serialize null creds: {json}"
+        );
+    }
+
+    #[test]
+    fn robot_disconnected_round_trips() {
+        let msg = ServerMsg::RobotDisconnected {
+            robot: RobotId("robot-1".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(msg, serde_json::from_str::<ServerMsg>(&json).unwrap());
+        assert!(
+            json.contains("robot_disconnected"),
+            "snake_case tag expected: {json}"
         );
     }
 }

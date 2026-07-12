@@ -16,6 +16,10 @@ use crate::discovery;
 /// robot's heartbeat cadence.
 const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Consecutive keepalive send failures before the session is declared dead
+/// (~15s at the 5s cadence). Covers the half-open case the read side can't see.
+const MAX_PING_FAILURES: u32 = 3;
+
 /// Where the session pushes decoded frames, telemetry, and status. Implementations
 /// are the headless logger (Task 3) and the Slint UI bridge (Task 4).
 pub trait UiSink: Send + Sync + 'static {
@@ -132,6 +136,7 @@ async fn run_answer_loop(
 
     let mut control_closed = false;
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
+    let mut ping_failures = 0u32;
     loop {
         tokio::select! {
             msg = rx.recv::<ServerMsg>() => {
@@ -143,6 +148,11 @@ async fn run_answer_loop(
                         }
                     }
                     Some(ServerMsg::Error { message }) => ui.status(&format!("error: {message}")),
+                    Some(ServerMsg::RobotDisconnected { robot }) => {
+                        ui.status(&format!("robot {robot} disconnected"));
+                        tracing::warn!("robot {robot} disconnected — ending session");
+                        break;
+                    }
                     Some(_) => {}
                     None => { ui.status("connection closed"); break; }
                 }
@@ -176,8 +186,16 @@ async fn run_answer_loop(
                 }
             }
             _ = keepalive.tick() => {
-                if let Err(e) = tx.send_ping().await {
-                    tracing::warn!("ws keepalive failed: {e}");
+                match tx.send_ping().await {
+                    Ok(()) => ping_failures = 0,
+                    Err(e) => {
+                        ping_failures += 1;
+                        tracing::warn!("ws keepalive failed ({ping_failures}/{MAX_PING_FAILURES}): {e}");
+                        if ping_failures >= MAX_PING_FAILURES {
+                            ui.status("connection lost (keepalive failed)");
+                            break;
+                        }
+                    }
                 }
             }
         }

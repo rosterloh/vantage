@@ -281,9 +281,7 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
                 relay_to(
                     &state,
                     &s.0,
-                    ServerMsg::Error {
-                        message: "robot disconnected".into(),
-                    },
+                    ServerMsg::RobotDisconnected { robot: id.clone() },
                 )
                 .await;
                 state.sessions.lock().await.close(&s);
