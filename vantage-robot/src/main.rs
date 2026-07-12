@@ -196,6 +196,9 @@ async fn main() -> Result<()> {
                             Err(e) => { tracing::warn!("failed to add consumer for {s}: {e}"); continue; }
                         };
                         watchdog.arm(s.clone(), std::time::Instant::now());
+                        // A replacement client starts a new seq/epoch; stale
+                        // freshness state would judge all its commands OutOfOrder.
+                        freshness.forget(&s);
                         consumers.insert(s, c);
                     }
                     Ok(Some(ServerMsg::ClientDisconnected { session: s })) => {
