@@ -9,7 +9,7 @@ use gstreamer_video::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use vantage_protocol::control::{CONTROL_LABEL, ControlMsg};
+use vantage_protocol::control::{CONTROL_LABEL, ControlEnvelope, ControlMsg};
 use vantage_protocol::signalling::{IceServer, Signal};
 
 #[derive(Debug)]
@@ -41,6 +41,30 @@ pub struct RawFrame {
     pub data: Vec<u8>,    // tightly packed, width*height*3 bytes
 }
 
+/// Frames waiting for a consumer are ~1 MB each, so the queue must stay small and
+/// bounded; when the consumer stalls, new frames are dropped until it drains.
+pub(crate) const FRAME_QUEUE_DEPTH: usize = 4;
+
+/// Push a frame from a GStreamer streaming thread — must never block. Returns
+/// whether the frame was queued; drops are counted and logged every 100th.
+pub(crate) fn try_push_frame<T>(
+    tx: &mpsc::Sender<T>,
+    frame: T,
+    dropped: &std::sync::atomic::AtomicU64,
+) -> bool {
+    match tx.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(100) {
+                tracing::warn!("frame consumer stalled — {n} frames dropped so far");
+            }
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
 pub struct Peer {
     pub pipeline: gst::Pipeline,
     pub webrtcbin: gst::Element,
@@ -50,8 +74,10 @@ pub struct Peer {
     /// The operator→robot `control` channel, populated when the robot's control DC
     /// arrives via `on-data-channel` (shared with that closure, hence `Arc`).
     control_channel: Arc<std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>>,
-    frames_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<VideoFrame>>,
-    frames_tx: mpsc::UnboundedSender<VideoFrame>,
+    frames_rx: tokio::sync::Mutex<mpsc::Receiver<VideoFrame>>,
+    frames_tx: mpsc::Sender<VideoFrame>,
+    control_seq: std::sync::atomic::AtomicU64,
+    control_epoch: std::time::Instant,
 }
 
 impl Peer {
@@ -73,7 +99,7 @@ impl Peer {
 
         wire_local_ice(&webrtcbin, &tx);
 
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel::<VideoFrame>();
+        let (frames_tx, frames_rx) = mpsc::channel::<VideoFrame>(FRAME_QUEUE_DEPTH);
 
         let peer = Self {
             pipeline,
@@ -84,6 +110,8 @@ impl Peer {
             control_channel: Arc::new(std::sync::Mutex::new(None)),
             frames_rx: tokio::sync::Mutex::new(frames_rx),
             frames_tx: frames_tx.clone(),
+            control_seq: std::sync::atomic::AtomicU64::new(0),
+            control_epoch: std::time::Instant::now(),
         };
 
         // The SCTP transport is only available once the pipeline is PLAYING; the decode
@@ -184,11 +212,13 @@ impl Peer {
         Ok(())
     }
 
-    /// Send a teleop command on the operator→robot `control` channel. No-op (with a
-    /// debug log) until the control channel has arrived and opened.
+    /// Send a teleop command on the operator→robot `control` channel, wrapped in a
+    /// seq+timestamp envelope so the robot can reject reordered/stale commands.
+    /// No-op (with a debug log) until the control channel has arrived and opened.
     pub fn send_control(&self, msg: &ControlMsg) -> Result<()> {
         if let Some(dc) = self.control_channel.lock().unwrap().as_ref() {
-            let bytes = vantage_protocol::codec::encode(msg)?;
+            let env = next_envelope(&self.control_seq, self.control_epoch, *msg);
+            let bytes = vantage_protocol::codec::encode(&env)?;
             let glib_bytes = glib::Bytes::from(&bytes);
             dc.emit_by_name::<()>("send-data", &[&glib_bytes]);
         } else {
@@ -325,7 +355,7 @@ pub(crate) fn wire_on_negotiation_needed(
 fn wire_video_receiver(
     pipeline: &gst::Pipeline,
     webrtcbin: &gst::Element,
-    frames_tx: &mpsc::UnboundedSender<VideoFrame>,
+    frames_tx: &mpsc::Sender<VideoFrame>,
 ) {
     let pipeline = pipeline.clone();
     let frames_tx = frames_tx.clone();
@@ -342,7 +372,7 @@ fn wire_video_receiver(
 fn build_decode_branch(
     pipeline: &gst::Pipeline,
     src_pad: &gst::Pad,
-    frames_tx: &mpsc::UnboundedSender<VideoFrame>,
+    frames_tx: &mpsc::Sender<VideoFrame>,
 ) -> Result<()> {
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
     let parse = gst::ElementFactory::make("h264parse").build()?;
@@ -361,6 +391,7 @@ fn build_decode_branch(
 
     {
         let frames_tx = frames_tx.clone();
+        let dropped = std::sync::atomic::AtomicU64::new(0);
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -382,11 +413,15 @@ fn build_decode_branch(
                         let start = row * stride;
                         rgba.extend_from_slice(&src[start..start + width * 4]);
                     }
-                    let _ = frames_tx.send(VideoFrame {
-                        width: width as u32,
-                        height: height as u32,
-                        rgba,
-                    });
+                    try_push_frame(
+                        &frames_tx,
+                        VideoFrame {
+                            width: width as u32,
+                            height: height as u32,
+                            rgba,
+                        },
+                        &dropped,
+                    );
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -406,13 +441,57 @@ fn build_decode_branch(
     Ok(())
 }
 
+fn next_envelope(
+    seq: &std::sync::atomic::AtomicU64,
+    epoch: std::time::Instant,
+    msg: ControlMsg,
+) -> ControlEnvelope {
+    ControlEnvelope {
+        seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        sent_ms: epoch.elapsed().as_millis() as u64,
+        msg,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn try_push_frame_drops_on_full_and_counts() {
+        let (tx, mut rx) = mpsc::channel::<u32>(2);
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        assert!(try_push_frame(&tx, 1, &dropped));
+        assert!(try_push_frame(&tx, 2, &dropped));
+        assert!(!try_push_frame(&tx, 3, &dropped)); // full → dropped
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap(), 1); // drop-newest: 1 and 2 survive
+        assert!(try_push_frame(&tx, 4, &dropped)); // space again after a recv
+    }
+
+    #[test]
+    fn try_push_frame_is_silent_false_on_closed() {
+        let (tx, rx) = mpsc::channel::<u32>(2);
+        drop(rx);
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        assert!(!try_push_frame(&tx, 1, &dropped));
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn peer_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Peer>();
+    }
+
+    #[test]
+    fn next_envelope_stamps_strictly_increasing_seq() {
+        let seq = std::sync::atomic::AtomicU64::new(0);
+        let epoch = std::time::Instant::now();
+        let a = next_envelope(&seq, epoch, ControlMsg::KeepAlive);
+        let b = next_envelope(&seq, epoch, ControlMsg::KeepAlive);
+        assert_eq!(a.seq, 1);
+        assert_eq!(b.seq, 2);
+        assert!(b.sent_ms >= a.sent_ms);
     }
 }

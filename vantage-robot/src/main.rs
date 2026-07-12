@@ -22,7 +22,7 @@ use vantage_signalling::robot_media::{Consumer, RobotMedia};
 use vantage_signalling::ws::CoordinatorWs;
 
 use metrics::RobotMetrics;
-use safety::Watchdog;
+use safety::{Admit, Freshness, Watchdog};
 use telemetry::Sampler;
 
 #[tokio::main]
@@ -57,6 +57,8 @@ async fn main() -> Result<()> {
     let mut dc_open: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
     // Teleop disconnect failsafe: no command is acted on unless its session is live.
     let mut watchdog = Watchdog::default();
+    let mut freshness = Freshness::default();
+    let control_epoch = std::time::Instant::now();
     let mut sampler = Sampler::new();
     let metrics = RobotMetrics::new();
 
@@ -194,6 +196,9 @@ async fn main() -> Result<()> {
                             Err(e) => { tracing::warn!("failed to add consumer for {s}: {e}"); continue; }
                         };
                         watchdog.arm(s.clone(), std::time::Instant::now());
+                        // A replacement client starts a new seq/epoch; stale
+                        // freshness state would judge all its commands OutOfOrder.
+                        freshness.forget(&s);
                         consumers.insert(s, c);
                     }
                     Ok(Some(ServerMsg::ClientDisconnected { session: s })) => {
@@ -202,6 +207,7 @@ async fn main() -> Result<()> {
                             media.remove_consumer(c);
                         }
                         watchdog.disarm(&s);
+                        freshness.forget(&s);
                         tracing::warn!("safe-state entered: {s} (disconnect)");
                         dc_open.remove(&s);
                     }
@@ -231,15 +237,24 @@ async fn main() -> Result<()> {
                     }
                     Some((_, PeerEvent::DataMessage(_))) => { /* telemetry is robot->client only */ }
                     Some((s, PeerEvent::Control(bytes))) => {
-                        match codec::decode::<vantage_protocol::ControlMsg>(&bytes) {
-                            Ok(msg) => {
-                                // A fresh command re-arms the watchdog (and clears any
-                                // prior staleness trip — a momentary stall self-heals).
-                                watchdog.feed(&s, std::time::Instant::now());
-                                // SAFETY GATE: only act on the command while the session
-                                // is live; otherwise hold the neutral command.
-                                if watchdog.is_live(&s) {
-                                    act_on_control(&s, msg);
+                        match codec::decode::<vantage_protocol::ControlEnvelope>(&bytes) {
+                            Ok(env) => {
+                                let arrival_ms = control_epoch.elapsed().as_millis() as u64;
+                                match freshness.admit(&s, env.seq, env.sent_ms, arrival_ms) {
+                                    Admit::Fresh => {
+                                        // A fresh command re-arms the watchdog (and clears any
+                                        // prior staleness trip — a momentary stall self-heals).
+                                        watchdog.feed(&s, std::time::Instant::now());
+                                        // SAFETY GATE: only act on the command while the session
+                                        // is live; otherwise hold the neutral command.
+                                        if watchdog.is_live(&s) {
+                                            act_on_control(&s, env.msg);
+                                        }
+                                    }
+                                    verdict => tracing::warn!(
+                                        "dropping control from {s}: {verdict:?} (seq {})",
+                                        env.seq
+                                    ),
                                 }
                             }
                             Err(e) => tracing::warn!("bad control message from {s}: {e}"),
@@ -284,6 +299,7 @@ async fn main() -> Result<()> {
     pump.abort();
     for (s, c) in consumers.drain() {
         watchdog.disarm(&s);
+        freshness.forget(&s);
         media.remove_consumer(c);
     }
     if !received_shutdown {

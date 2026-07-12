@@ -29,7 +29,7 @@ pub struct RobotMedia {
     rtptee: gst::Element,
     enc: gst::Element,
     ice_servers: Vec<IceServer>,
-    raw_frames_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RawFrame>>,
+    raw_frames_rx: tokio::sync::Mutex<mpsc::Receiver<RawFrame>>,
 }
 
 impl RobotMedia {
@@ -99,7 +99,7 @@ impl RobotMedia {
             .build()?;
 
         // raw branch: tee → queue → videoconvert → RGB appsink → RawFrame  (verbatim from 4a)
-        let (raw_tx, raw_frames_rx) = mpsc::unbounded_channel::<RawFrame>();
+        let (raw_tx, raw_frames_rx) = mpsc::channel::<RawFrame>(crate::peer::FRAME_QUEUE_DEPTH);
         let (rqueue, rconvert, rawsink_el) = build_raw_branch(&raw_tx)?;
 
         pipeline.add_many([
@@ -428,7 +428,7 @@ impl Consumer {
 /// `RawFrame`s on `raw_tx`. Returns the three elements (appsink upcast to Element)
 /// so the caller can add and link them. Lifted verbatim from 4a's `add_video_source`.
 fn build_raw_branch(
-    raw_tx: &mpsc::UnboundedSender<RawFrame>,
+    raw_tx: &mpsc::Sender<RawFrame>,
 ) -> Result<(gst::Element, gst::Element, gst::Element)> {
     let rqueue = gst::ElementFactory::make("queue").build()?;
     let rconvert = gst::ElementFactory::make("videoconvert").build()?;
@@ -443,6 +443,7 @@ fn build_raw_branch(
         .build();
     {
         let raw_tx = raw_tx.clone();
+        let dropped = std::sync::atomic::AtomicU64::new(0);
         rawsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -462,12 +463,16 @@ fn build_raw_branch(
                         let start = row * stride;
                         data.extend_from_slice(&src[start..start + width * 3]);
                     }
-                    let _ = raw_tx.send(RawFrame {
-                        width: width as u32,
-                        height: height as u32,
-                        encoding: "rgb8".into(),
-                        data,
-                    });
+                    crate::peer::try_push_frame(
+                        &raw_tx,
+                        RawFrame {
+                            width: width as u32,
+                            height: height as u32,
+                            encoding: "rgb8".into(),
+                            data,
+                        },
+                        &dropped,
+                    );
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),

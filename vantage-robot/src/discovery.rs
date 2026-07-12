@@ -17,7 +17,7 @@ use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::RobotMedia;
 use vantage_signalling::ws::PeerWs;
 
-use crate::safety::Watchdog;
+use crate::safety::{Admit, Freshness, Watchdog};
 use crate::telemetry::Sampler;
 
 /// Bind the direct signalling listener on an ephemeral port and spawn its accept
@@ -101,6 +101,8 @@ async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStr
     let consumer = media.add_consumer(session.clone(), events_tx)?;
     let mut watchdog = Watchdog::default();
     watchdog.arm(session.clone(), Instant::now());
+    let mut freshness = Freshness::default();
+    let control_epoch = Instant::now();
     let mut dc_open = false;
     let mut sampler = Sampler::new();
     let mut watchdog_tick = tokio::time::interval(Duration::from_millis(100));
@@ -125,11 +127,23 @@ async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStr
                     }
                     Some((_, PeerEvent::DataChannelOpen)) => { dc_open = true; }
                     Some((s, PeerEvent::Control(bytes))) => {
-                        if let Ok(cmd) = vantage_protocol::codec::decode::<vantage_protocol::ControlMsg>(&bytes) {
-                            watchdog.feed(&s, Instant::now());
-                            if watchdog.is_live(&s) {
-                                crate::act_on_control(&s, cmd);
+                        match vantage_protocol::codec::decode::<vantage_protocol::ControlEnvelope>(&bytes) {
+                            Ok(env) => {
+                                let arrival_ms = control_epoch.elapsed().as_millis() as u64;
+                                match freshness.admit(&s, env.seq, env.sent_ms, arrival_ms) {
+                                    Admit::Fresh => {
+                                        watchdog.feed(&s, Instant::now());
+                                        if watchdog.is_live(&s) {
+                                            crate::act_on_control(&s, env.msg);
+                                        }
+                                    }
+                                    verdict => tracing::warn!(
+                                        "dropping control from {s}: {verdict:?} (seq {})",
+                                        env.seq
+                                    ),
+                                }
                             }
+                            Err(e) => tracing::warn!("bad control message from {s}: {e}"),
                         }
                     }
                     Some((_, PeerEvent::DataMessage(_))) => {}
