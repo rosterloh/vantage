@@ -3,7 +3,7 @@
 ```bash
 # 1. Build and install the binary
 cargo build --release -p vantage-coordinator
-sudo install -Dm755 target/release/vantage-coordinator /usr/local/bin/vantage-coordinator
+sudo install -Dm755 target/release/vantage-coordinator /usr/bin/vantage-coordinator
 
 # 2. Create a dedicated unprivileged user
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin vantage

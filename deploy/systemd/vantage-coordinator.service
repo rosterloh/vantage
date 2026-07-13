@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vantage-coordinator
+ExecStart=/usr/bin/vantage-coordinator
 EnvironmentFile=/etc/vantage/coordinator.env
 Environment=RUST_LOG=info
 Restart=on-failure
