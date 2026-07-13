@@ -3,6 +3,7 @@ name = "vantage-coordinator"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+description = "Vantage rendezvous service: robot registration/heartbeat, client discovery, SDP/ICE relay, fleet stats, ICE-server provisioning."
 
 [lib]
 name = "vantage_coordinator"
@@ -31,3 +32,23 @@ vantage-protocol = { path = "../vantage-protocol" }
 serde_json.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+[package.metadata.deb]
+name = "vantage-coordinator"
+maintainer = "Richard Osterloh <richard.osterloh@gmail.com>"
+copyright = "2026, Richard Osterloh"
+extended-description = """\
+Rendezvous service for the Vantage fleet: robot registration and heartbeat, \
+client discovery, WebRTC SDP/ICE relay, fleet stats, and ICE-server \
+provisioning. See /usr/share/doc/vantage-coordinator/coordinator.env.example \
+for configuration."""
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/vantage-coordinator", "usr/bin/", "755"],
+    ["../.env.example", "usr/share/doc/vantage-coordinator/coordinator.env.example", "644"],
+    ["../README.md", "usr/share/doc/vantage-coordinator/README.md", "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-scripts = "../deploy/systemd", unit-name = "vantage-coordinator", enable = false, start = false }

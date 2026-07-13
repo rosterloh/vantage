@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! getent passwd vantage >/dev/null; then
+        adduser --system --no-create-home --group --shell /usr/sbin/nologin vantage
+    fi
+
+    install -d -o root -g vantage -m 0750 /etc/vantage
+    if [ ! -e /etc/vantage/coordinator.env ]; then
+        install -o root -g vantage -m 0640 /usr/share/doc/vantage-coordinator/coordinator.env.example \
+            /etc/vantage/coordinator.env
+        echo "vantage-coordinator: wrote /etc/vantage/coordinator.env from the example template — edit it (VANTAGE_COORDINATOR_TOKEN in particular) before starting the service." >&2
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

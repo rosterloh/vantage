@@ -103,6 +103,36 @@ RUST_LOG=info VANTAGE_COORDINATOR=ws://localhost:8080 cargo run -p vantage-clien
 | `VANTAGE_TURN_URL`  | _(unset)_        | TURN server URL; when set, added to the ICE config handed to peers. |
 | `VANTAGE_TURN_USER` | _(unset)_        | TURN username (static credential for the PoC). |
 | `VANTAGE_TURN_PASS` | _(unset)_        | TURN credential. |
+| `VANTAGE_COORDINATOR_TOKEN` | _(unset)_ | Shared bearer token (see [Security](#security) below). |
+
+## Security
+
+### Bearer-token auth
+
+Set `VANTAGE_COORDINATOR_TOKEN` to require `Authorization: Bearer <token>` on every
+coordinator route except `/healthz` (WS upgrades, `/ice`, `/stats`). Generate one
+with `openssl rand -hex 32`. The robot and client read the same variable from
+their own process environment and present it on the WS handshake and the `/ice`
+fetch — no separate configuration needed on those binaries. Token comparison is
+constant-time to avoid timing side-channels.
+
+Leaving the token unset runs the coordinator **open**: any peer can register as a
+robot, enumerate the fleet, open sessions, and fetch TURN credentials. The
+coordinator logs a warning at startup in this case. See
+[.env.example](.env.example) for setup, including a note on rotating TURN
+credentials that were ever served by an unauthenticated `/ice` endpoint.
+
+### DoS hardening
+
+- **Message size cap** — WS messages/frames are capped at 64 KiB
+  (`MAX_WS_MESSAGE_BYTES`); signalling payloads are a few KB, so anything larger
+  is rejected at the transport level.
+- **Bounded outbound queues** — each peer's outbound channel holds at most 256
+  messages (`OUTBOUND_QUEUE_DEPTH`). A slow reader gets messages dropped with a
+  warning log instead of growing coordinator memory without bound.
+- **Idle-connection reaping** — a peer socket with no inbound frame for 20s
+  (`PEER_IDLE_TIMEOUT`, well above the robot's 5s heartbeat) is treated as dead
+  and torn down, freeing its registry/session/peer entries.
 
 ## Observability (OpenTelemetry → Grafana)
 

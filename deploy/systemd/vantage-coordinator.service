@@ -1,0 +1,36 @@
+[Unit]
+Description=Vantage coordinator (rendezvous service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vantage-coordinator
+EnvironmentFile=/etc/vantage/coordinator.env
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+
+# Run as an unprivileged, dedicated user (create with:
+# useradd --system --no-create-home --shell /usr/sbin/nologin vantage)
+User=vantage
+Group=vantage
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
