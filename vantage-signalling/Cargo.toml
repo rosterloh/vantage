@@ -12,7 +12,7 @@ tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 gstreamer = { version = "0.25", features = ["v1_22"] }
 gstreamer-webrtc = { version = "0.25", features = ["v1_22"] }
