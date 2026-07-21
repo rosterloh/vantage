@@ -107,6 +107,41 @@ you'd build the entire feedback loop yourself.
 - GCC convergence needs a non-catastrophic cap; at 3× oversubscription the feedback
   loop itself drowns and even the adaptive path can't recover.
 
+## Update — upstream MoQ changes since this ran (checked 2026-07-21)
+
+This spike built `moq-dev/moq` at HEAD ~2026-06-30 (negotiated `moq-lite-04`); the
+wire has since moved to `lite-06` with many breaking (`!`) API changes. `run.sh`
+clones relay + plugin from the same HEAD, so they stay version-matched and it still
+builds — but two findings above now rest on premises upstream has invalidated. The
+**recommendation is unchanged** (hybrid: WebRTC last hop, MoQ relay for fan-out);
+the *reasoning* needs these corrections.
+
+- **Finding 3 (HOL blocking / "delivers everything, unbounded p99").** The eval
+  said *"MoQ would need app-level frame-dropping to compete"* — that now exists.
+  `moq-net` gained a per-subscription latency budget (`latency_max`, #2176/#2349):
+  "how long to wait for a stalled group before skipping to a newer one", and
+  `moqsrc` hardcodes it — `Consumer::new(...).with_latency(1s)` (source/imp.rs). So
+  on a re-run the loss rows would **drop late groups and bound latency near the
+  budget** instead of delivering 300/300 with p99 to 742ms. WebRTC still wins the
+  last hop (1s budget ≫ its ~57ms bounded p99), but the mechanism is no longer
+  missing. Caveat: the budget is hardcoded at 1s with **no `moqsrc` property** to
+  tune it — competing would mean patching moq-gst to lower/expose it, not building
+  frame-dropping from scratch.
+
+- **Congestion / adaptive bitrate.** `feat(moq-video)!: adapt the encoder bitrate
+  to the congestion-control estimate` (#2303) adds a real estimate→encoder loop
+  (`moq_video::encode::rate::{Control, Policy}`) plus BBR3 CC. **But it lives in the
+  native `moq-cli`/`moq-video` publisher, not `moqsink`** — `moqsink` still only
+  exposes `estimated-send-bitrate`/`estimated-recv-bitrate` as read-only signals.
+  So the finding stands for the gst path, but the cost dropped: the bandwidth signal
+  is plumbed and there's a reference policy to port onto `x264enc`.
+
+- **Finding 2 ("no buffer, 0.8ms").** Now a consequence of that same 1s `moqsrc`
+  budget — a configurable skip window, not an intrinsic "no buffer" property.
+
+Numbers above are not re-measured; re-run `./compare.sh` against current HEAD for
+fresh loss/latency figures reflecting the frame-drop budget.
+
 ## Probe knobs
 
 `SECS`, `BITRATE` (kbit/s), `PATTERN` (videotestsrc), and for `webrtc-lat`:
