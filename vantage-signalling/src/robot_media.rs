@@ -495,6 +495,9 @@ fn link_tee(tee: &gst::Element, downstream: &gst::Element) -> Result<()> {
 }
 
 /// `VANTAGE_VIDEO_SOURCE=camera` → v4l2src (`VANTAGE_CAMERA_DEVICE`, default /dev/video0);
+/// `VANTAGE_VIDEO_SOURCE=libcamera` → libcamerasrc (Raspberry Pi CSI camera modules,
+/// which the legacy V4L2 stack can't drive; `VANTAGE_LIBCAMERA_NAME` selects a camera
+/// by name when more than one is attached, default picks the first detected camera);
 /// anything else (default) → videotestsrc SMPTE pattern.
 fn build_source() -> Result<gst::Element> {
     let kind = std::env::var("VANTAGE_VIDEO_SOURCE").unwrap_or_else(|_| "test".into());
@@ -505,6 +508,16 @@ fn build_source() -> Result<gst::Element> {
             .property("device", dev.as_str())
             .build()
             .context("v4l2src — camera source")
+    } else if kind == "libcamera" {
+        let name = std::env::var("VANTAGE_LIBCAMERA_NAME").ok();
+        tracing::info!("video source: libcamera {}", name.as_deref().unwrap_or("(default)"));
+        let mut builder = gst::ElementFactory::make("libcamerasrc");
+        if let Some(name) = &name {
+            builder = builder.property("camera-name", name.as_str());
+        }
+        builder
+            .build()
+            .context("libcamerasrc — Raspberry Pi CSI camera source (install gstreamer1.0-libcamera)")
     } else {
         tracing::info!("video source: test pattern");
         gst::ElementFactory::make("videotestsrc")
