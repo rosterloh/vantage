@@ -510,14 +510,17 @@ fn build_source() -> Result<gst::Element> {
             .context("v4l2src — camera source")
     } else if kind == "libcamera" {
         let name = std::env::var("VANTAGE_LIBCAMERA_NAME").ok();
-        tracing::info!("video source: libcamera {}", name.as_deref().unwrap_or("(default)"));
+        tracing::info!(
+            "video source: libcamera {}",
+            name.as_deref().unwrap_or("(default)")
+        );
         let mut builder = gst::ElementFactory::make("libcamerasrc");
         if let Some(name) = &name {
             builder = builder.property("camera-name", name.as_str());
         }
-        builder
-            .build()
-            .context("libcamerasrc — Raspberry Pi CSI camera source (install gstreamer1.0-libcamera)")
+        builder.build().context(
+            "libcamerasrc — Raspberry Pi CSI camera source (install gstreamer1.0-libcamera)",
+        )
     } else {
         tracing::info!("video source: test pattern");
         gst::ElementFactory::make("videotestsrc")
