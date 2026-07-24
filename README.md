@@ -45,12 +45,41 @@ sudo apt-get install -y \
   libgstreamer-plugins-bad1.0-dev \
   gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-ugly \
   gstreamer1.0-nice \
-  libnice-dev
+  libnice-dev \
+  libfontconfig1-dev
 ```
 
 > `vantage-protocol` and `vantage-coordinator` have **no** GStreamer dependency and
 > build/test without these packages. Only the media crates require them.
+>
+> `gstreamer1.0-plugins-ugly` provides `x264enc`, the H.264 encoder the
+> `vantage-signalling` tests and the `videotestsrc`/software-encode robot pipeline
+> fall back to when no hardware encoder is present. `libfontconfig1-dev` is needed
+> to build `vantage-client` (font rendering for the operator console UI).
+
+**Raspberry Pi CSI camera (Camera Module, HQ Camera, etc.):** these run through
+`libcamera`, not the legacy V4L2 stack, so `v4l2src` won't see them. Install the
+libcamera GStreamer plugin and set `VANTAGE_VIDEO_SOURCE=libcamera`:
+
+```bash
+sudo apt-get install -y gstreamer1.0-libcamera
+```
+
+A USB webcam still works with the default `v4l2src` path
+(`VANTAGE_VIDEO_SOURCE=camera`, `VANTAGE_CAMERA_DEVICE=/dev/videoN`).
+
+If more than one CSI camera is attached, select one with `VANTAGE_LIBCAMERA_NAME`;
+unset, `libcamerasrc` uses the first camera it detects. This must be the full
+libcamera camera ID, not the sensor name shown in brackets — run
+`rpicam-hello --list-cameras` and use the path in parentheses, e.g.:
+
+```
+0 : imx708_wide [4608x2592 10-bit RGGB] (/base/axi/pcie@1000120000/rp1/i2c@88000/imx708@1a)
+```
+
+`VANTAGE_LIBCAMERA_NAME=/base/axi/pcie@1000120000/rp1/i2c@88000/imx708@1a`
 
 Verify the install:
 

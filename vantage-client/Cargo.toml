@@ -13,6 +13,6 @@ serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 mdns-sd.workspace = true
 slint = "1"
