@@ -21,17 +21,17 @@ serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-axum = { version = "0.8", features = ["ws"] }
-futures-util = "0.3"
-dotenvy = "0.15"
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = "0.3.34"
+dotenvy = "0.15.7"
 
 [dev-dependencies]
-tokio-tungstenite = "0.30"
-futures-util = "0.3"
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
 vantage-protocol = { path = "../vantage-protocol" }
 serde_json.workspace = true
 tokio.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 
 [package.metadata.deb]
 name = "vantage-coordinator"
