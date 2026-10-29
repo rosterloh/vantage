@@ -14,11 +14,11 @@ use crate::discovery;
 
 /// Must stay well under the coordinator's 20s peer idle timeout; 5s matches the
 /// robot's heartbeat cadence.
-const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Consecutive keepalive send failures before the session is declared dead
 /// (~15s at the 5s cadence). Covers the half-open case the read side can't see.
-const MAX_PING_FAILURES: u32 = 3;
+pub(crate) const MAX_PING_FAILURES: u32 = 3;
 
 /// Where the session pushes decoded frames, telemetry, and status. Implementations
 /// are the headless logger (Task 3) and the Slint UI bridge (Task 4).
@@ -205,7 +205,7 @@ async fn run_answer_loop(
     Ok(())
 }
 
-async fn fetch_ice(coord: &str, token: Option<&str>) -> Result<Vec<IceServer>> {
+pub(crate) async fn fetch_ice(coord: &str, token: Option<&str>) -> Result<Vec<IceServer>> {
     let http = coord.replacen("ws", "http", 1);
     let mut req = reqwest::Client::new().get(format!("{http}/ice"));
     if let Some(t) = token {

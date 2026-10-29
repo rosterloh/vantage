@@ -227,6 +227,27 @@ impl Peer {
         Ok(())
     }
 
+    /// Open an SSH tunnel channel to the robot and return it as a byte stream. Call
+    /// once the session is up (e.g. after `DataChannelOpen`): the SCTP association
+    /// already exists, so this needs no renegotiation. Writes before the channel
+    /// opens are buffered; the stream reads EOF if the robot refuses the channel.
+    pub fn open_ssh_channel(&self) -> Result<tokio::io::DuplexStream> {
+        let dc = self
+            .webrtcbin
+            .emit_by_name_with_values(
+                "create-data-channel",
+                &[
+                    vantage_protocol::SSH_LABEL.to_value(),
+                    None::<gst::Structure>.to_value(),
+                ],
+            )
+            .context("create-data-channel(ssh) returned no value")?
+            .get::<gst_webrtc::WebRTCDataChannel>()
+            .context("create-data-channel(ssh) returned null")?;
+        let (stream, _pump) = crate::tunnel::attach(dc, &tokio::runtime::Handle::try_current()?);
+        Ok(stream)
+    }
+
     /// Tear down the decode pipeline (sets it to Null).
     pub fn shutdown(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
