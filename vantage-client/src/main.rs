@@ -1,5 +1,6 @@
 mod discovery;
 mod session;
+mod ssh_proxy;
 mod ui;
 
 use std::sync::Arc;
@@ -68,6 +69,25 @@ async fn headless_control(control_tx: mpsc::UnboundedSender<ControlMsg>) {
 
 fn main() -> anyhow::Result<()> {
     let _otel = vantage_observability::init("vantage-client");
+
+    // `vantage-client ssh-proxy <robot>`: OpenSSH ProxyCommand mode (stdio tunnel).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("ssh-proxy") {
+        let Some(robot) = args.get(2).cloned() else {
+            anyhow::bail!("usage: vantage-client ssh-proxy <robot-id-or-name>");
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let result = rt.block_on(ssh_proxy::run(coordinator_url(), robot));
+        if let Err(e) = &result {
+            eprintln!("vantage-client ssh-proxy: {e:#}");
+        }
+        // Exit without waiting on tokio's blocking stdin reader, which would
+        // otherwise hold the runtime open until the next line of input.
+        drop(_otel);
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
 
     let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlMsg>();
 

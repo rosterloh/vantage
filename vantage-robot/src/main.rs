@@ -19,6 +19,7 @@ use vantage_protocol::signalling::{IceServer, RobotInfo, RobotMsg, ServerMsg, de
 use vantage_protocol::{RobotId, SessionId};
 use vantage_signalling::peer::PeerEvent;
 use vantage_signalling::robot_media::{Consumer, RobotMedia};
+use vantage_signalling::tunnel::SshTunnelConfig;
 use vantage_signalling::ws::CoordinatorWs;
 
 use metrics::RobotMetrics;
@@ -44,15 +45,27 @@ async fn main() -> Result<()> {
             tracing::warn!("ICE fetch failed ({e}) — using STUN-only defaults (LAN/direct path)");
             default_ice()
         });
+    // SSH tunnels are off unless VANTAGE_SSH_ENABLE is set; advertise them only then.
+    let ssh = SshTunnelConfig::from_env();
+    let mut capabilities = vec!["telemetry".to_string()];
+    if let Some(cfg) = &ssh {
+        tracing::info!(
+            "SSH tunnels enabled -> {} (max {} per session)",
+            cfg.target,
+            cfg.max_channels
+        );
+        capabilities.push(vantage_protocol::SSH_CAPABILITY.into());
+    }
     let robot_info = RobotInfo {
         id: id.clone(),
         name: std::env::var("VANTAGE_ROBOT_NAME").unwrap_or_else(|_| "Atlas".into()),
-        capabilities: vec!["telemetry".into()],
+        capabilities,
     };
 
     // ONE shared capture/encode engine: camera → tee → encode-once → rtptee fan-out,
     // plus the raw pre-encode branch. Built (and PLAYed) once; encoder runs once.
-    let media = Arc::new(RobotMedia::new(&ice)?);
+    // The same engine serves both the coordinator and LAN paths, so SSH applies to both.
+    let media = Arc::new(RobotMedia::new(&ice)?.with_ssh(ssh));
     // Sessions whose telemetry data channel is open.
     let mut dc_open: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
     // Teleop disconnect failsafe: no command is acted on unless its session is live.

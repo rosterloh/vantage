@@ -134,6 +134,50 @@ RUST_LOG=info VANTAGE_COORDINATOR=ws://localhost:8080 cargo run -p vantage-clien
 | `VANTAGE_TURN_PASS` | _(unset)_        | TURN credential. |
 | `VANTAGE_COORDINATOR_TOKEN` | _(unset)_ | Shared bearer token (see [Security](#security) below). |
 
+## SSH over WebRTC
+
+Operators can SSH into a robot through the same WebRTC session that carries video
+and telemetry, so `ssh`, `scp`, `rsync` and VS Code Remote work from anywhere the
+client can reach the robot (coordinator + STUN/TURN, or the mDNS LAN path).
+
+Each SSH connection gets its own reliable, ordered data channel labelled `ssh`.
+The robot bridges it to its own `sshd`; the client exposes it to OpenSSH as a
+`ProxyCommand`. SSH runs end to end, so authentication and encryption are plain
+OpenSSH: robot host keys, your user keys, `known_hosts`.
+
+**Robot** — off by default:
+
+| Variable                   | Default        | Purpose |
+|----------------------------|----------------|---------|
+| `VANTAGE_SSH_ENABLE`       | _(unset)_      | `1` accepts SSH channels and advertises the `ssh` capability. |
+| `VANTAGE_SSH_TARGET`       | `127.0.0.1:22` | Where tunnelled connections go. Fixed by the robot; operators cannot choose a destination. |
+| `VANTAGE_SSH_MAX_CHANNELS` | `4`            | Concurrent SSH connections allowed per operator session. |
+
+**Operator** — add to `~/.ssh/config` (with `VANTAGE_COORDINATOR` and, if set,
+`VANTAGE_COORDINATOR_TOKEN` in the environment):
+
+```
+Host robot-*
+  ProxyCommand vantage-client ssh-proxy %h
+```
+
+then `ssh robot-1` (the host name is matched against the robot id or name). The
+proxy runs headless and logs only to stderr. Closing the WebRTC session drops
+every SSH connection that rode on it.
+
+**Hardening:**
+
+- Keep strict host key checking on and distribute robot host keys (or an SSH CA)
+  out of band. DTLS fingerprints travel through the coordinator in SDP, so the
+  coordinator, or anyone holding its token, could intercept the WebRTC layer; the
+  SSH host key check is what detects that.
+- Use key-only auth (`PasswordAuthentication no`) and no root login. Binding
+  `sshd` to loopback makes the data channel the only way in.
+- `sshd` sees every tunnelled connection as coming from `127.0.0.1`; the robot logs
+  the Vantage session id with each SSH channel open and close instead.
+- Bulk copies share the link with video. On thin or TURN-relayed links, expect
+  `scp` to lower video quality.
+
 ## Security
 
 ### Bearer-token auth

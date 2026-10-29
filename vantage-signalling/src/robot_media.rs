@@ -20,6 +20,10 @@ use crate::peer::{
     PeerEvent, RawFrame, configure_ice, parse_sdp, wire_data_channel, wire_local_ice,
     wire_on_negotiation_needed,
 };
+use crate::tunnel::{self, SshTunnelConfig};
+
+/// Live SSH tunnel tasks for one consumer; aborted when the consumer is removed.
+type Tunnels = std::sync::Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>;
 
 /// The single shared capture/encode engine. Owns the pipeline, the `rtptee`
 /// fan-out point, and the raw pre-encode frame channel. Built (and PLAYed) once
@@ -30,6 +34,8 @@ pub struct RobotMedia {
     enc: gst::Element,
     ice_servers: Vec<IceServer>,
     raw_frames_rx: tokio::sync::Mutex<mpsc::Receiver<RawFrame>>,
+    /// SSH tunnels; `None` (the default) closes every operator-created channel.
+    ssh: Option<SshTunnelConfig>,
 }
 
 impl RobotMedia {
@@ -131,7 +137,14 @@ impl RobotMedia {
             enc,
             ice_servers: ice_servers.to_vec(),
             raw_frames_rx: tokio::sync::Mutex::new(raw_frames_rx),
+            ssh: None,
         })
+    }
+
+    /// Accept operator-created `ssh` channels and bridge each to `cfg.target`.
+    pub fn with_ssh(mut self, cfg: Option<SshTunnelConfig>) -> Self {
+        self.ssh = cfg;
+        self
     }
 
     /// Add a per-session consumer: request an `rtptee` src pad, add `queue → webrtcbin`
@@ -279,6 +292,10 @@ impl RobotMedia {
             .context("create-data-channel(control) returned null")?;
         wire_control_channel(&control_dc, &tx);
 
+        // Operator-created channels (SSH tunnels) arrive here; anything else is closed.
+        let tunnels = Tunnels::default();
+        wire_operator_channels(&webrtcbin, &session, self.ssh.clone(), &tunnels);
+
         wire_on_negotiation_needed(&webrtcbin, &tx);
 
         // Force a keyframe so the new viewer gets an IDR immediately instead of
@@ -303,6 +320,7 @@ impl RobotMedia {
             rtptee_pad,
             data_channel: std::sync::Mutex::new(Some(dc)),
             forwarder,
+            tunnels,
         })
     }
 
@@ -316,10 +334,13 @@ impl RobotMedia {
             queue,
             rtptee_pad,
             forwarder,
+            tunnels,
             ..
         } = consumer;
         tracing::info!("removing consumer {session}");
         forwarder.abort();
+        // Drop every SSH connection riding on this session.
+        tunnels.lock().unwrap().abort_all();
         let pipeline = self.pipeline.clone();
         let rtptee = self.rtptee.clone();
 
@@ -363,6 +384,7 @@ pub struct Consumer {
     rtptee_pad: gst::Pad,
     data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
     forwarder: tokio::task::JoinHandle<()>,
+    tunnels: Tunnels,
 }
 
 /// Options for the `control` data channel: unreliable + unordered so a lost or late
@@ -383,6 +405,76 @@ fn wire_control_channel(dc: &gst_webrtc::WebRTCDataChannel, tx: &mpsc::Unbounded
         if let Ok(bytes) = vals[1].get::<glib::Bytes>() {
             let _ = tx.send(PeerEvent::Control(bytes.to_vec()));
         }
+        None
+    });
+}
+
+/// Handle channels the operator creates on this session. Only reliable, ordered
+/// `ssh` channels are accepted, and only when SSH is enabled and the session is
+/// under its channel cap; each one is bridged to the configured target (never a
+/// destination the operator chooses). Everything else is closed.
+fn wire_operator_channels(
+    webrtcbin: &gst::Element,
+    session: &SessionId,
+    ssh: Option<SshTunnelConfig>,
+    tunnels: &Tunnels,
+) {
+    // Captured now: `on-data-channel` fires on a GStreamer thread with no runtime.
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(rt) => Some(rt),
+        Err(_) if ssh.is_none() => None,
+        Err(_) => {
+            tracing::warn!("no tokio runtime for {session}; SSH tunnels unavailable");
+            None
+        }
+    };
+    let session = session.clone();
+    let tunnels = tunnels.clone();
+    webrtcbin.connect("on-data-channel", false, move |vals| {
+        let dc = vals[1].get::<gst_webrtc::WebRTCDataChannel>().unwrap();
+        let label = dc.label().map(|l| l.to_string()).unwrap_or_default();
+        let (Some(cfg), Some(rt)) = (&ssh, &rt) else {
+            tracing::warn!("closing operator channel '{label}' from {session}: SSH disabled");
+            dc.close();
+            return None;
+        };
+        if label != vantage_protocol::SSH_LABEL {
+            tracing::warn!("closing unexpected operator channel '{label}' from {session}");
+            dc.close();
+            return None;
+        }
+        if !tunnel::is_reliable_ordered(&dc) {
+            tracing::warn!("closing unreliable/unordered ssh channel from {session}");
+            dc.close();
+            return None;
+        }
+        let mut set = tunnels.lock().unwrap();
+        while set.try_join_next().is_some() {}
+        if set.len() >= cfg.max_channels {
+            tracing::warn!(
+                "closing ssh channel from {session}: limit of {} reached",
+                cfg.max_channels
+            );
+            dc.close();
+            return None;
+        }
+        let id = dc.id();
+        let (stream, pump) = tunnel::attach(dc, rt);
+        let target = cfg.target.clone();
+        let session = session.clone();
+        tracing::info!("ssh channel {id} opened by {session} -> {target}");
+        set.spawn_on(
+            async move {
+                match tunnel::bridge_to_tcp(stream, &target).await {
+                    Ok((sent, received)) => tracing::info!(
+                        "ssh channel {id} for {session} closed ({sent} B to robot, {received} B to operator)"
+                    ),
+                    Err(e) => tracing::warn!("ssh channel {id} for {session} ended: {e}"),
+                }
+                let _ = pump.await;
+            },
+            rt,
+        );
         None
     });
 }
