@@ -174,13 +174,18 @@ impl RobotMedia {
         };
 
         let webrtcbin = gst::ElementFactory::make("webrtcbin")
-            .name(format!("wrb-{}", session.0))
+            // Unique per consumer: teardown runs asynchronously, so a reconnecting
+            // session can add its new webrtcbin before the old one has left the bin.
+            .name(format!("wrb-{}-{}", session.0, next_consumer_id()))
             .property("bundle-policy", gst_webrtc::WebRTCBundlePolicy::MaxBundle)
             .build()
             .context("webrtcbin missing — install gst-plugins-bad")?;
         configure_ice(&webrtcbin, &self.ice_servers);
         wire_local_ice(&webrtcbin, &tx);
-
+        // Connected before the element goes PLAYING and gains its sink pad and data
+        // channels: `on-negotiation-needed` can fire as soon as any of those happen,
+        // and a consumer that misses it never offers (#49).
+        wire_on_negotiation_needed(&webrtcbin, &tx);
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream")
             .build()?;
@@ -296,8 +301,6 @@ impl RobotMedia {
         let tunnels = Tunnels::default();
         wire_operator_channels(&webrtcbin, &session, self.ssh.clone(), &tunnels);
 
-        wire_on_negotiation_needed(&webrtcbin, &tx);
-
         // Force a keyframe so the new viewer gets an IDR immediately instead of
         // waiting up to ~1 s for the periodic IDR (key-int-max=30 @30fps).
         // Send the event upstream from the encoder's src pad — more reliable than
@@ -324,9 +327,16 @@ impl RobotMedia {
         })
     }
 
-    /// Tear down a consumer via a blocking IDLE pad probe: fires when the
-    /// `rtptee` src pad feeding this consumer is not mid-buffer, guaranteeing
-    /// the unlink/remove is safe on a PLAYING pipeline.
+    /// Tear down a consumer via an IDLE pad probe: it fires when the `rtptee` src
+    /// pad feeding this consumer is not mid-buffer, so the unlink is safe on a
+    /// PLAYING pipeline. The state changes then run on their own thread, never on
+    /// the caller's (the robot's event loop) or a streaming thread.
+    ///
+    /// `webrtcbin` goes to Null before `queue`: until the transport is up,
+    /// `webrtcbin` blocks incoming buffers, so the queue's streaming thread can be
+    /// parked mid-push holding its pad's stream lock. Stopping the queue first would
+    /// wait on that lock forever (#49); deactivating `webrtcbin` first flushes the
+    /// push and releases it.
     pub fn remove_consumer(&self, consumer: Consumer) {
         let Consumer {
             session,
@@ -348,17 +358,23 @@ impl RobotMedia {
             .clone()
             .add_probe(gst::PadProbeType::IDLE, move |pad, _info| {
                 tracing::debug!("consumer teardown probe fired");
-                // 1. unlink rtptee → queue
+                // 1. unlink rtptee → queue, and release the request pad so rtptee
+                //    stops producing for it (allow-not-linked=true means zero
+                //    consumers does not error the engine)
                 if let Some(qsink) = queue.static_pad("sink") {
                     let _ = pad.unlink(&qsink);
                 }
-                // 2. remove queue + webrtcbin from the live pipeline and set to Null
-                let _ = pipeline.remove_many([&queue, &webrtcbin]);
-                let _ = queue.set_state(gst::State::Null);
-                let _ = webrtcbin.set_state(gst::State::Null);
-                // 3. release the request pad so rtptee stops producing for it
-                //    (allow-not-linked=true means zero consumers does not error the engine)
                 rtptee.release_request_pad(pad);
+                // 2. stop and remove the branch off-thread, webrtcbin first (see above)
+                let (pipeline, queue, webrtcbin) =
+                    (pipeline.clone(), queue.clone(), webrtcbin.clone());
+                let session = session.clone();
+                std::thread::spawn(move || {
+                    let _ = webrtcbin.set_state(gst::State::Null);
+                    let _ = queue.set_state(gst::State::Null);
+                    let _ = pipeline.remove_many([&queue, &webrtcbin]);
+                    tracing::debug!("consumer {session} torn down");
+                });
                 gst::PadProbeReturn::Remove
             });
     }
@@ -372,6 +388,12 @@ impl RobotMedia {
     pub fn shutdown(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+/// Monotonic suffix for consumer element names (see `add_consumer`).
+fn next_consumer_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// One connected client: a `webrtcbin` fed by a `queue` tapped off `rtptee`, plus
@@ -653,6 +675,42 @@ mod tests {
                 );
             }
             other => panic!("expected an Offer, got {other:?}"),
+        }
+    }
+
+    /// A consumer whose session never connects still gets encoded buffers pushed
+    /// at its `webrtcbin`, which blocks them until the transport is up. Removing it
+    /// must not wait on that blocked push (#49).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_consumer_that_never_connected_does_not_hang() {
+        let media = std::sync::Arc::new(RobotMedia::new(&[]).expect("robot media builds"));
+        let baseline = media.pipeline.children().len();
+        for i in 0..3 {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let consumer = media
+                .add_consumer(SessionId(format!("stalled-{i}")), tx)
+                .expect("consumer builds");
+            // Let the encoder fill the queue and block inside webrtcbin.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // A plain thread, so a hang fails the test instead of wedging the runtime.
+            let m = media.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                m.remove_consumer(consumer);
+                let _ = done_tx.send(());
+            });
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("remove_consumer returns within 5s");
+            // The off-thread teardown must actually finish, not just be scheduled.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while media.pipeline.children().len() != baseline {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "consumer {i} branch still in the pipeline after 5s"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
     }
 
