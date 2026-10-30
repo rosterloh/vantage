@@ -54,9 +54,9 @@ impl CameraBridge {
 
     /// Publish one frame as Image + CameraInfo, sharing one timestamp + frame_id.
     pub fn publish(&self, frame: RawFrame) -> Result<(), Error> {
+        let (sec, nanosec) = secs_nanos(frame.stamp);
         let ci = camera_info_parts(&frame); // borrow first...
         let parts = image_parts(frame); // ...then move the pixel buffer.
-        let (sec, nanosec) = now_secs_nanos();
 
         // Build via Default + field mutation so we only ever name the message
         // types (header/stamp nested types come from Default).
@@ -84,11 +84,8 @@ impl CameraBridge {
     }
 }
 
-/// Wall-clock stamp as (sec, nanosec). Uses the system clock rather than the ROS
-/// node clock; sufficient for 4b (placeholder calibration).
-fn now_secs_nanos() -> (i32, u32) {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+/// Wall-clock time as a ROS stamp (sec, nanosec).
+fn secs_nanos(t: std::time::SystemTime) -> (i32, u32) {
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (d.as_secs().min(i32::MAX as u64) as i32, d.subsec_nanos())
 }

@@ -562,6 +562,8 @@ fn build_raw_branch(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let stamp =
+                        capture_time(sink, &sample).unwrap_or_else(std::time::SystemTime::now);
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
                     let info =
@@ -584,6 +586,7 @@ fn build_raw_branch(
                             height: height as u32,
                             encoding: "rgb8".into(),
                             data,
+                            stamp,
                         },
                         &dropped,
                     );
@@ -594,6 +597,17 @@ fn build_raw_branch(
     }
     let rawsink_el: gst::Element = rawsink.upcast();
     Ok((rqueue, rconvert, rawsink_el))
+}
+
+/// Wall time minus how long ago (on the pipeline clock) the buffer's PTS was,
+/// so the stamp excludes queueing and conversion downstream of the source.
+fn capture_time(sink: &gst_app::AppSink, sample: &gst::Sample) -> Option<std::time::SystemTime> {
+    let pts = sample.buffer()?.pts()?;
+    let segment = sample.segment()?.downcast_ref::<gst::ClockTime>()?;
+    let pts_running = segment.to_running_time(pts)?;
+    let now_running = sink.clock()?.time().checked_sub(sink.base_time()?)?;
+    let age = now_running.saturating_sub(pts_running);
+    std::time::SystemTime::now().checked_sub(std::time::Duration::from_nanos(age.nseconds()))
 }
 
 /// Request a `src_%u` pad off the tee and link it to a downstream element's sink.
@@ -676,6 +690,19 @@ mod tests {
             }
             other => panic!("expected an Offer, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn raw_frames_carry_recent_capture_stamp() {
+        let media = RobotMedia::new(&[]).expect("robot media builds");
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), media.recv_raw_frame())
+            .await
+            .expect("raw frame within 5s")
+            .expect("raw branch open");
+        let age = std::time::SystemTime::now()
+            .duration_since(frame.stamp)
+            .expect("stamp not in the future");
+        assert!(age < std::time::Duration::from_secs(2), "{age:?}");
     }
 
     /// A consumer whose session never connects still gets encoded buffers pushed

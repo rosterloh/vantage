@@ -57,6 +57,7 @@ mod tests {
             height: h,
             encoding: "rgb8".to_string(),
             data: vec![0u8; (w * h * 3) as usize],
+            stamp: std::time::SystemTime::UNIX_EPOCH,
         }
     }
 

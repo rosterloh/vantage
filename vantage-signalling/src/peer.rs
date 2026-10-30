@@ -39,6 +39,8 @@ pub struct RawFrame {
     pub height: u32,
     pub encoding: String, // "rgb8"
     pub data: Vec<u8>,    // tightly packed, width*height*3 bytes
+    /// Wall-clock capture time, from the buffer PTS when the pipeline clock allows.
+    pub stamp: std::time::SystemTime,
 }
 
 /// Frames waiting for a consumer are ~1 MB each, so the queue must stay small and
