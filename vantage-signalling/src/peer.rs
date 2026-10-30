@@ -337,41 +337,34 @@ pub(crate) fn parse_sdp(
     Ok(gst_webrtc::WebRTCSessionDescription::new(ty, msg))
 }
 
-pub(crate) fn wire_on_negotiation_needed(
-    webrtcbin: &gst::Element,
-    tx: &mpsc::UnboundedSender<PeerEvent>,
-) {
-    let bin = webrtcbin.clone();
-    let txn = tx.clone();
-    webrtcbin.connect("on-negotiation-needed", false, move |_| {
-        let bin2 = bin.clone();
-        let tx2 = txn.clone();
-        let promise = gst::Promise::with_change_func(move |reply| {
-            let reply = match reply {
-                Ok(Some(r)) => r,
-                _ => {
-                    tracing::error!("create-offer produced no reply");
-                    return;
-                }
-            };
-            let Some(offer) = reply
-                .value("offer")
-                .ok()
-                .and_then(|v| v.get::<gst_webrtc::WebRTCSessionDescription>().ok())
-            else {
-                tracing::error!("create-offer reply missing a valid offer");
+/// Create an offer, set it as the local description and send it on `tx`.
+pub(crate) fn create_offer(webrtcbin: &gst::Element, tx: &mpsc::UnboundedSender<PeerEvent>) {
+    let bin2 = webrtcbin.clone();
+    let tx2 = tx.clone();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let reply = match reply {
+            Ok(Some(r)) => r,
+            _ => {
+                tracing::error!("create-offer produced no reply");
                 return;
-            };
-            bin2.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
-            let Some(sdp) = offer.sdp().as_text().ok() else {
-                tracing::error!("offer SDP not serialisable");
-                return;
-            };
-            let _ = tx2.send(PeerEvent::LocalDescription(Signal::Offer { sdp }));
-        });
-        bin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
-        None
+            }
+        };
+        let Some(offer) = reply
+            .value("offer")
+            .ok()
+            .and_then(|v| v.get::<gst_webrtc::WebRTCSessionDescription>().ok())
+        else {
+            tracing::error!("create-offer reply missing a valid offer");
+            return;
+        };
+        bin2.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
+        let Some(sdp) = offer.sdp().as_text().ok() else {
+            tracing::error!("offer SDP not serialisable");
+            return;
+        };
+        let _ = tx2.send(PeerEvent::LocalDescription(Signal::Offer { sdp }));
     });
+    webrtcbin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
 }
 
 /// On the answerer, decode the incoming H.264 track to RGBA frames.
