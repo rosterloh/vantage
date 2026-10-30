@@ -17,8 +17,7 @@ use vantage_protocol::SessionId;
 use vantage_protocol::signalling::{IceServer, Signal};
 
 use crate::peer::{
-    PeerEvent, RawFrame, configure_ice, parse_sdp, wire_data_channel, wire_local_ice,
-    wire_on_negotiation_needed,
+    PeerEvent, RawFrame, configure_ice, create_offer, parse_sdp, wire_data_channel, wire_local_ice,
 };
 use crate::tunnel::{self, SshTunnelConfig};
 
@@ -182,10 +181,6 @@ impl RobotMedia {
             .context("webrtcbin missing — install gst-plugins-bad")?;
         configure_ice(&webrtcbin, &self.ice_servers);
         wire_local_ice(&webrtcbin, &tx);
-        // Connected before the element goes PLAYING and gains its sink pad and data
-        // channels: `on-negotiation-needed` can fire as soon as any of those happen,
-        // and a consumer that misses it never offers (#49).
-        wire_on_negotiation_needed(&webrtcbin, &tx);
         let queue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream")
             .build()?;
@@ -206,14 +201,6 @@ impl RobotMedia {
             "direction",
             gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
         );
-
-        // rtptee → queue  (the encode-once tap for THIS consumer)
-        let rtptee_pad = self
-            .rtptee
-            .request_pad_simple("src_%u")
-            .context("rtptee has no src pad")?;
-        let qsink = queue.static_pad("sink").context("queue has no sink pad")?;
-        rtptee_pad.link(&qsink)?;
 
         // transport-cc adaptive bitrate: attach rtpgccbwe as an aux sender so
         // the encoder bitrate tracks the GCC estimate.
@@ -300,6 +287,31 @@ impl RobotMedia {
         // Operator-created channels (SSH tunnels) arrive here; anything else is closed.
         let tunnels = Tunnels::default();
         wire_operator_channels(&webrtcbin, &session, self.ssh.clone(), &tunnels);
+
+        // Offer on the first buffer pushed to webrtcbin, not on `on-negotiation-needed`:
+        // that can fire before the sink pad has caps, giving an offer with no m-lines
+        // that is never redone (#49). The queue's src probe runs after its sticky caps
+        // were delivered. Installed before the tap is linked: webrtcbin blocks the first
+        // buffer until connected, so a missed one is never followed by another.
+        let bin = webrtcbin.downgrade();
+        let offer_tx = tx.clone();
+        qsrc.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_, _| {
+                if let Some(bin) = bin.upgrade() {
+                    create_offer(&bin, &offer_tx);
+                }
+                gst::PadProbeReturn::Remove
+            },
+        );
+
+        // rtptee → queue  (the encode-once tap for THIS consumer)
+        let rtptee_pad = self
+            .rtptee
+            .request_pad_simple("src_%u")
+            .context("rtptee has no src pad")?;
+        let qsink = queue.static_pad("sink").context("queue has no sink pad")?;
+        rtptee_pad.link(&qsink)?;
 
         // Force a keyframe so the new viewer gets an IDR immediately instead of
         // waiting up to ~1 s for the periodic IDR (key-int-max=30 @30fps).
