@@ -72,6 +72,35 @@ pub enum ClientMsg {
     Signal {
         signal: Signal,
     },
+    /// How a dial went; sent once per dial, success or failure.
+    DialReport(DialReport),
+}
+
+/// Furthest checkpoint a client dial reached. Ordered: each implies the ones before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialStage {
+    SignallingConnected,
+    RobotSelected,
+    OfferReceived,
+    AnswerSent,
+    /// Data channel open: the dial succeeded.
+    Ready,
+}
+
+/// One client dial's outcome, for fleet-level connection diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DialReport {
+    pub stage: DialStage,
+    pub duration_ms: u64,
+    /// ICE candidate types (`host`/`srflx`/`prflx`/`relay`) of the selected pair, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_candidate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_candidate: Option<String>,
+    /// Why the dial stopped short of `Ready`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// coordinator -> robot or client
@@ -146,6 +175,24 @@ mod tests {
             !json.contains("username"),
             "STUN entry must not serialize null creds: {json}"
         );
+    }
+
+    #[test]
+    fn dial_report_round_trips() {
+        let msg = ClientMsg::DialReport(DialReport {
+            stage: DialStage::Ready,
+            duration_ms: 812,
+            local_candidate: Some("host".into()),
+            remote_candidate: Some("relay".into()),
+            error: None,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(msg, serde_json::from_str::<ClientMsg>(&json).unwrap());
+        assert!(
+            !json.contains("error"),
+            "absent error must be omitted: {json}"
+        );
+        assert!(DialStage::OfferReceived < DialStage::Ready);
     }
 
     #[test]

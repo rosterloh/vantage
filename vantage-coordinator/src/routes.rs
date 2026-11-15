@@ -8,7 +8,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc};
-use vantage_protocol::signalling::{ClientMsg, IceServer, RobotMsg, ServerMsg};
+use vantage_protocol::signalling::{ClientMsg, DialReport, IceServer, RobotMsg, ServerMsg};
 use vantage_protocol::{FleetStats, RobotId, SessionId};
 
 use crate::registry::Registry;
@@ -291,6 +291,36 @@ pub async fn handle_robot(socket: WebSocket, state: Arc<AppState>) {
     pump.abort();
 }
 
+/// Log a client's dial outcome and count it by stage and selected candidate type.
+fn record_dial(session: &SessionId, r: &DialReport) {
+    use vantage_observability::opentelemetry::{KeyValue, global, metrics::Counter};
+    static DIALS: std::sync::LazyLock<Counter<u64>> = std::sync::LazyLock::new(|| {
+        global::meter("vantage-coordinator")
+            .u64_counter("vantage.coordinator.dial_reports")
+            .build()
+    });
+    let none = || "unknown".to_string();
+    let local = r.local_candidate.clone().unwrap_or_else(none);
+    let remote = r.remote_candidate.clone().unwrap_or_else(none);
+    tracing::info!(
+        session = %session.0,
+        stage = ?r.stage,
+        duration_ms = r.duration_ms,
+        local_candidate = %local,
+        remote_candidate = %remote,
+        error = r.error.as_deref().unwrap_or(""),
+        "dial report"
+    );
+    DIALS.add(
+        1,
+        &[
+            KeyValue::new("stage", format!("{:?}", r.stage)),
+            KeyValue::new("local_candidate", local),
+            KeyValue::new("remote_candidate", remote),
+        ],
+    );
+}
+
 async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {
     if let Some((_, out)) = state.peers.lock().await.get(peer_key) {
         send_or_drop(peer_key, out, msg);
@@ -403,6 +433,7 @@ pub async fn handle_client(socket: WebSocket, state: Arc<AppState>) {
                     .await;
                 }
             }
+            ClientMsg::DialReport(r) => record_dial(&session, &r),
         }
     }
 
