@@ -122,17 +122,7 @@ async fn via_coordinator(coord: &str, token: Option<&str>, ui: &dyn UiSink) -> R
     }
     .await;
 
-    let (local_candidate, remote_candidate) = match &result {
-        Ok(peer) => peer.selected_candidate_types().await.unzip(),
-        Err(_) => (None, None),
-    };
-    let report = DialReport {
-        stage,
-        duration_ms: started.elapsed().as_millis() as u64,
-        local_candidate,
-        remote_candidate,
-        error: result.as_ref().err().map(|e| format!("{e:#}")),
-    };
+    let report = dial_report("coordinator", stage, started, &result).await;
     if let Err(e) = tx.send(&ClientMsg::DialReport(report)).await {
         tracing::debug!("dial report not sent: {e}");
     }
@@ -146,6 +136,7 @@ async fn via_coordinator(coord: &str, token: Option<&str>, ui: &dyn UiSink) -> R
 /// mDNS LAN fast path: browse for a robot and connect directly to its signalling
 /// endpoint (the robot offers immediately; no ListRobots/Connect needed).
 async fn via_mdns(ui: &dyn UiSink) -> Result<Link> {
+    let started = Instant::now();
     let robots = discovery::discover(Duration::from_secs(2)).await?;
     let target = robots
         .into_iter()
@@ -158,13 +149,73 @@ async fn via_mdns(ui: &dyn UiSink) -> Result<Link> {
     ));
 
     let ws = CoordinatorWs::connect(&format!("ws://{}", target.addr)).await?;
-    // No coordinator to fetch ICE from; host candidates carry the LAN.
-    let peer = Arc::new(Peer::new(&default_ice())?);
     let (mut tx, mut rx) = ws.split();
-    // No coordinator to report to on this path, so the stage is only tracked.
-    let mut stage = DialStage::SignallingConnected;
-    negotiate(&peer, &mut tx, &mut rx, &mut stage, ui).await?;
-    Ok(Link { peer, tx, rx })
+    let mut stage = DialStage::RobotSelected;
+    let result = async {
+        // No coordinator to fetch ICE from; host candidates carry the LAN.
+        let peer = Arc::new(Peer::new(&default_ice())?);
+        negotiate(&peer, &mut tx, &mut rx, &mut stage, ui).await?;
+        Ok(peer)
+    }
+    .await;
+    // No coordinator on this path: the report only reaches the client's own OTLP.
+    dial_report("lan", stage, started, &result).await;
+    Ok(Link {
+        peer: result?,
+        tx,
+        rx,
+    })
+}
+
+/// Build a dial's report and record it in this client's metrics. Only dials that
+/// reached their signalling server are reported, so an absent LAN robot is not noise.
+async fn dial_report(
+    path: &'static str,
+    stage: DialStage,
+    started: Instant,
+    result: &Result<Arc<Peer>>,
+) -> DialReport {
+    use vantage_observability::opentelemetry::{
+        KeyValue, global,
+        metrics::{Counter, Histogram},
+    };
+    static DIALS: std::sync::LazyLock<(Counter<u64>, Histogram<u64>)> =
+        std::sync::LazyLock::new(|| {
+            let m = global::meter("vantage-client");
+            (
+                m.u64_counter("vantage.client.dial_reports").build(),
+                m.u64_histogram("vantage.client.dial_duration")
+                    .with_unit("ms")
+                    .build(),
+            )
+        });
+    let (local_candidate, remote_candidate) = match result {
+        Ok(peer) => peer.selected_candidate_types().await.unzip(),
+        Err(_) => (None, None),
+    };
+    let report = DialReport {
+        stage,
+        duration_ms: started.elapsed().as_millis() as u64,
+        local_candidate,
+        remote_candidate,
+        error: result.as_ref().err().map(|e| format!("{e:#}")),
+    };
+    let unknown = || "unknown".to_string();
+    let attrs = [
+        KeyValue::new("path", path),
+        KeyValue::new("stage", format!("{:?}", report.stage)),
+        KeyValue::new(
+            "local_candidate",
+            report.local_candidate.clone().unwrap_or_else(unknown),
+        ),
+        KeyValue::new(
+            "remote_candidate",
+            report.remote_candidate.clone().unwrap_or_else(unknown),
+        ),
+    ];
+    DIALS.0.add(1, &attrs);
+    DIALS.1.record(report.duration_ms, &attrs);
+    report
 }
 
 /// Relay signalling until the robot's data channel opens, advancing `stage`.
