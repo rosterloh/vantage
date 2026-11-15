@@ -250,10 +250,59 @@ impl Peer {
         Ok(stream)
     }
 
+    /// ICE candidate types (local, remote) of the selected pair, e.g. `("host", "relay")`.
+    /// The pair can lag the data channel opening, so this polls for up to ~2 s;
+    /// `None` if none was selected by then.
+    pub async fn selected_candidate_types(&self) -> Option<(String, String)> {
+        for _ in 0..20 {
+            if let Some(types) = self.stats_candidate_types().await {
+                return Some(types);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    async fn stats_candidate_types(&self) -> Option<(String, String)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let _ = tx.send(reply.ok().flatten().and_then(selected_candidate_types));
+        });
+        self.webrtcbin
+            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        rx.await.ok().flatten()
+    }
+
     /// Tear down the decode pipeline (sets it to Null).
     pub fn shutdown(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+/// Stops the pipeline when a peer is dropped without `shutdown`, e.g. the losing
+/// side of a connection race.
+impl Drop for Peer {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// Follow webrtcbin stats from the transport's `selected-candidate-pair-id` to the
+/// pair's local and remote candidates and return their `candidate-type`s.
+fn selected_candidate_types(stats: &gst::StructureRef) -> Option<(String, String)> {
+    let entry = |id: &str| stats.get::<gst::Structure>(id).ok();
+    let pair_id = stats.iter().find_map(|(_, v)| {
+        v.get::<gst::Structure>()
+            .ok()?
+            .get::<String>("selected-candidate-pair-id")
+            .ok()
+    })?;
+    let pair = entry(&pair_id)?;
+    let kind = |field: &str| {
+        let id = pair.get::<String>(field).ok()?;
+        entry(&id)?.get::<String>("candidate-type").ok()
+    };
+    Some((kind("local-candidate-id")?, kind("remote-candidate-id")?))
 }
 
 /// Apply the STUN/TURN config (and the relay-only diagnostic toggle) to a webrtcbin.

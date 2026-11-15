@@ -1,14 +1,16 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use vantage_protocol::ControlMsg;
 use vantage_protocol::codec;
-use vantage_protocol::signalling::{ClientMsg, IceServer, ServerMsg, default_ice};
+use vantage_protocol::signalling::{
+    ClientMsg, DialReport, DialStage, IceServer, ServerMsg, Signal, default_ice,
+};
 use vantage_protocol::telemetry::DeviceInfo;
 use vantage_signalling::peer::{Peer, PeerEvent, VideoFrame};
 use vantage_signalling::ws::{CoordinatorWs, CoordinatorWsRx, CoordinatorWsTx};
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::discovery;
 
@@ -28,6 +30,16 @@ pub trait UiSink: Send + Sync + 'static {
     fn status(&self, text: &str);
 }
 
+/// A dial that has not reached an open data channel by now is abandoned.
+const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A negotiated connection, ready for the session loop.
+struct Link {
+    peer: Arc<Peer>,
+    tx: CoordinatorWsTx,
+    rx: CoordinatorWsRx,
+}
+
 #[tracing::instrument(skip(ui, control_rx))]
 pub async fn run_session(
     coord: String,
@@ -37,56 +49,94 @@ pub async fn run_session(
     let token = std::env::var("VANTAGE_COORDINATOR_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
-    // Primary path: the coordinator. If it is unreachable, fall back to the mDNS
-    // LAN fast path (offline direct connect).
-    match CoordinatorWs::connect_with_token(&format!("{coord}/ws/client"), token.as_deref()).await {
-        Ok(ws) => run_via_coordinator(coord, token, ws, ui, control_rx).await,
-        Err(e) => {
-            ui.status(&format!("coordinator unreachable ({e}); scanning LAN…"));
-            tracing::warn!("coordinator unreachable ({e}) — trying mDNS LAN fast path");
-            run_via_mdns(ui, control_rx).await
-        }
-    }
+    // Race the coordinator and the mDNS LAN path; the first to open a data channel
+    // wins and the other is dropped (closing its socket tears down its robot side).
+    let (link, path) = first_ok(
+        async {
+            via_coordinator(&coord, token.as_deref(), ui.as_ref())
+                .await
+                .map(|l| (l, "coordinator"))
+                .context("coordinator")
+        },
+        async {
+            via_mdns(ui.as_ref())
+                .await
+                .map(|l| (l, "LAN"))
+                .context("LAN")
+        },
+    )
+    .await?;
+    tracing::info!("connected via {path}");
+    ui.status(&format!("connected ({path})"));
+    run_answer_loop(link.peer, link.tx, link.rx, ui, control_rx).await
 }
 
-/// Coordinator path: discover via the robot list, then connect.
-async fn run_via_coordinator(
-    coord: String,
-    token: Option<String>,
-    mut ws: CoordinatorWs,
-    ui: Arc<dyn UiSink>,
-    control_rx: mpsc::UnboundedReceiver<ControlMsg>,
-) -> Result<()> {
-    ws.send(&ClientMsg::ListRobots).await?;
-    let robots = loop {
-        match ws.recv::<ServerMsg>().await? {
-            Some(ServerMsg::RobotList { robots }) => break robots,
-            Some(_) => continue,
-            None => anyhow::bail!("coordinator closed before sending robot list"),
-        }
+/// The first of `a` and `b` to succeed; if both fail, both errors.
+async fn first_ok<T>(
+    a: impl Future<Output = Result<T>>,
+    b: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::pin!(a, b);
+    let (first, other) = tokio::select! {
+        r = &mut a => match r {
+            Ok(v) => return Ok(v),
+            Err(e) => (e, b.await),
+        },
+        r = &mut b => match r {
+            Ok(v) => return Ok(v),
+            Err(e) => (e, a.await),
+        },
     };
-    let target = robots
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no robots online"))?;
-    ui.status(&format!("connecting to {}", target.name));
-    ws.send(&ClientMsg::Connect {
-        robot: target.id.clone(),
-    })
-    .await?;
+    other.map_err(|e| anyhow::anyhow!("{first:#}; {e:#}"))
+}
 
-    let ice = fetch_ice(&coord, token.as_deref()).await?;
-    let peer = Arc::new(Peer::new(&ice)?);
-    let (tx, rx) = ws.split();
-    run_answer_loop(peer, tx, rx, ui, control_rx).await
+/// Coordinator path: pick a robot, negotiate, and report how far the dial got.
+async fn via_coordinator(coord: &str, token: Option<&str>, ui: &dyn UiSink) -> Result<Link> {
+    let started = Instant::now();
+    let ws = CoordinatorWs::connect_with_token(&format!("{coord}/ws/client"), token).await?;
+    let (mut tx, mut rx) = ws.split();
+    let mut stage = DialStage::SignallingConnected;
+    let result = async {
+        tx.send(&ClientMsg::ListRobots).await?;
+        let robots = loop {
+            match rx.recv::<ServerMsg>().await? {
+                Some(ServerMsg::RobotList { robots }) => break robots,
+                Some(_) => continue,
+                None => anyhow::bail!("coordinator closed before sending robot list"),
+            }
+        };
+        let target = robots
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no robots online"))?;
+        ui.status(&format!("connecting to {}", target.name));
+        tx.send(&ClientMsg::Connect {
+            robot: target.id.clone(),
+        })
+        .await?;
+        stage = DialStage::RobotSelected;
+        let ice = fetch_ice(coord, token).await?;
+        let peer = Arc::new(Peer::new(&ice)?);
+        negotiate(&peer, &mut tx, &mut rx, &mut stage, ui).await?;
+        Ok(peer)
+    }
+    .await;
+
+    let report = dial_report("coordinator", stage, started, &result).await;
+    if let Err(e) = tx.send(&ClientMsg::DialReport(report)).await {
+        tracing::debug!("dial report not sent: {e}");
+    }
+    Ok(Link {
+        peer: result?,
+        tx,
+        rx,
+    })
 }
 
 /// mDNS LAN fast path: browse for a robot and connect directly to its signalling
 /// endpoint (the robot offers immediately; no ListRobots/Connect needed).
-async fn run_via_mdns(
-    ui: Arc<dyn UiSink>,
-    control_rx: mpsc::UnboundedReceiver<ControlMsg>,
-) -> Result<()> {
+async fn via_mdns(ui: &dyn UiSink) -> Result<Link> {
+    let started = Instant::now();
     let robots = discovery::discover(Duration::from_secs(2)).await?;
     let target = robots
         .into_iter()
@@ -99,10 +149,122 @@ async fn run_via_mdns(
     ));
 
     let ws = CoordinatorWs::connect(&format!("ws://{}", target.addr)).await?;
-    // No coordinator to fetch ICE from; host candidates carry the LAN.
-    let peer = Arc::new(Peer::new(&default_ice())?);
-    let (tx, rx) = ws.split();
-    run_answer_loop(peer, tx, rx, ui, control_rx).await
+    let (mut tx, mut rx) = ws.split();
+    let mut stage = DialStage::RobotSelected;
+    let result = async {
+        // No coordinator to fetch ICE from; host candidates carry the LAN.
+        let peer = Arc::new(Peer::new(&default_ice())?);
+        negotiate(&peer, &mut tx, &mut rx, &mut stage, ui).await?;
+        Ok(peer)
+    }
+    .await;
+    // No coordinator on this path: the report only reaches the client's own OTLP.
+    dial_report("lan", stage, started, &result).await;
+    Ok(Link {
+        peer: result?,
+        tx,
+        rx,
+    })
+}
+
+/// Build a dial's report and record it in this client's metrics. Only dials that
+/// reached their signalling server are reported, so an absent LAN robot is not noise.
+async fn dial_report(
+    path: &'static str,
+    stage: DialStage,
+    started: Instant,
+    result: &Result<Arc<Peer>>,
+) -> DialReport {
+    use vantage_observability::opentelemetry::{
+        KeyValue, global,
+        metrics::{Counter, Histogram},
+    };
+    static DIALS: std::sync::LazyLock<(Counter<u64>, Histogram<u64>)> =
+        std::sync::LazyLock::new(|| {
+            let m = global::meter("vantage-client");
+            (
+                m.u64_counter("vantage.client.dial_reports").build(),
+                m.u64_histogram("vantage.client.dial_duration")
+                    .with_unit("ms")
+                    .build(),
+            )
+        });
+    let (local_candidate, remote_candidate) = match result {
+        Ok(peer) => peer.selected_candidate_types().await.unzip(),
+        Err(_) => (None, None),
+    };
+    let report = DialReport {
+        stage,
+        duration_ms: started.elapsed().as_millis() as u64,
+        local_candidate,
+        remote_candidate,
+        error: result.as_ref().err().map(|e| format!("{e:#}")),
+    };
+    let unknown = || "unknown".to_string();
+    let attrs = [
+        KeyValue::new("path", path),
+        KeyValue::new("stage", format!("{:?}", report.stage)),
+        KeyValue::new(
+            "local_candidate",
+            report.local_candidate.clone().unwrap_or_else(unknown),
+        ),
+        KeyValue::new(
+            "remote_candidate",
+            report.remote_candidate.clone().unwrap_or_else(unknown),
+        ),
+    ];
+    DIALS.0.add(1, &attrs);
+    DIALS.1.record(report.duration_ms, &attrs);
+    report
+}
+
+/// Relay signalling until the robot's data channel opens, advancing `stage`.
+async fn negotiate(
+    peer: &Peer,
+    tx: &mut CoordinatorWsTx,
+    rx: &mut CoordinatorWsRx,
+    stage: &mut DialStage,
+    ui: &dyn UiSink,
+) -> Result<()> {
+    tokio::time::timeout(NEGOTIATE_TIMEOUT, async {
+        loop {
+            tokio::select! {
+                msg = rx.recv::<ServerMsg>() => match msg? {
+                    Some(ServerMsg::Signal { signal, .. }) => {
+                        if matches!(signal, Signal::Offer { .. }) {
+                            *stage = (*stage).max(DialStage::OfferReceived);
+                        }
+                        if let Err(e) = peer.handle_signal(signal) {
+                            tracing::warn!("failed to apply signal: {e}");
+                        }
+                    }
+                    Some(ServerMsg::Error { message }) => ui.status(&format!("error: {message}")),
+                    Some(ServerMsg::RobotDisconnected { robot }) => {
+                        anyhow::bail!("robot {robot} disconnected")
+                    }
+                    Some(_) => {}
+                    None => anyhow::bail!("signalling closed"),
+                },
+                ev = peer.recv_event() => match ev {
+                    Some(PeerEvent::LocalDescription(sig)) => {
+                        tx.send(&ClientMsg::Signal { signal: sig }).await?;
+                        *stage = (*stage).max(DialStage::AnswerSent);
+                    }
+                    Some(PeerEvent::LocalIce(sig)) => {
+                        tx.send(&ClientMsg::Signal { signal: sig }).await?;
+                    }
+                    Some(PeerEvent::DataChannelOpen) => {
+                        *stage = DialStage::Ready;
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                    None => anyhow::bail!("peer closed"),
+                },
+            }
+        }
+    })
+    .await
+    .context("data channel did not open in time")?
 }
 
 /// The shared answerer loop: relay signalling, render frames/telemetry, forward
@@ -218,4 +380,34 @@ pub(crate) async fn fetch_ice(coord: &str, token: Option<&str>) -> Result<Vec<Ic
         .json::<Vec<IceServer>>()
         .await?;
     Ok(servers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn first_ok_takes_the_first_success() {
+        let slow_ok = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok("slow")
+        };
+        let fast_err = async { anyhow::bail!("down") };
+        assert_eq!(first_ok(fast_err, slow_ok).await.unwrap(), "slow");
+
+        let fast_ok = async { Ok("fast") };
+        let never = std::future::pending::<Result<&str>>();
+        assert_eq!(first_ok(never, fast_ok).await.unwrap(), "fast");
+    }
+
+    #[tokio::test]
+    async fn first_ok_reports_both_errors() {
+        let a = async { Err::<(), _>(anyhow::anyhow!("a failed")) };
+        let b = async { Err::<(), _>(anyhow::anyhow!("b failed")) };
+        let msg = first_ok(a, b).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("a failed") && msg.contains("b failed"),
+            "{msg}"
+        );
+    }
 }

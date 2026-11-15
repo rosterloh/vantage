@@ -141,3 +141,12 @@ async fn ssh_channel_is_refused_when_disabled() {
         .expect("read succeeds");
     assert_eq!(n, 0, "a refused channel reads EOF");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_candidate_types_are_reported_once_connected() {
+    let media = RobotMedia::new(&[]).expect("robot media builds");
+    let (_consumer, peer) = connect(&media).await;
+    // In-process loopback: both ends can only be host candidates.
+    let types = peer.selected_candidate_types().await;
+    assert_eq!(types, Some(("host".into(), "host".into())));
+}
