@@ -31,6 +31,11 @@ pub struct RobotMedia {
     pipeline: gst::Pipeline,
     rtptee: gst::Element,
     enc: gst::Element,
+    /// Gates the encoder: closed while nobody is watching, so an unwatched robot
+    /// spends no CPU encoding (the raw/ROS branch keeps flowing).
+    valve: gst::Element,
+    /// Connected consumers; the lock also orders valve open/close with the count.
+    viewers: std::sync::Mutex<usize>,
     ice_servers: Vec<IceServer>,
     raw_frames_rx: tokio::sync::Mutex<mpsc::Receiver<RawFrame>>,
     /// SSH tunnels; `None` (the default) closes every operator-created channel.
@@ -64,6 +69,11 @@ impl RobotMedia {
         // encode branch: tee → queue(leaky) → encoder(ONCE) → h264parse → rtph264pay → rtpcaps → rtptee
         let equeue = gst::ElementFactory::make("queue")
             .property_from_str("leaky", "downstream")
+            .build()?;
+        let valve = gst::ElementFactory::make("valve")
+            .property("drop", true)
+            // Keep caps/segment flowing so the encoder is negotiated when it opens.
+            .property_from_str("drop-mode", "forward-sticky-events")
             .build()?;
         let enc = crate::encoder::make_h264_encoder()?; // built exactly once
         let parse = gst::ElementFactory::make("h264parse").build()?;
@@ -113,6 +123,7 @@ impl RobotMedia {
             &srccaps,
             &tee,
             &equeue,
+            &valve,
             &enc,
             &parse,
             &pay,
@@ -123,7 +134,7 @@ impl RobotMedia {
             &rawsink_el,
         ])?;
         gst::Element::link_many([&source, &srcconvert, &srccaps, &tee])?;
-        gst::Element::link_many([&equeue, &enc, &parse, &pay, &rtpcaps, &rtptee])?;
+        gst::Element::link_many([&equeue, &valve, &enc, &parse, &pay, &rtpcaps, &rtptee])?;
         link_tee(&tee, &equeue)?;
         gst::Element::link_many([&rqueue, &rconvert, &rawsink_el])?;
         link_tee(&tee, &rqueue)?;
@@ -134,6 +145,8 @@ impl RobotMedia {
             pipeline,
             rtptee,
             enc,
+            valve,
+            viewers: std::sync::Mutex::new(0),
             ice_servers: ice_servers.to_vec(),
             raw_frames_rx: tokio::sync::Mutex::new(raw_frames_rx),
             ssh: None,
@@ -312,6 +325,7 @@ impl RobotMedia {
             .context("rtptee has no src pad")?;
         let qsink = queue.static_pad("sink").context("queue has no sink pad")?;
         rtptee_pad.link(&qsink)?;
+        self.set_viewers(|n| n + 1);
 
         // Force a keyframe so the new viewer gets an IDR immediately instead of
         // waiting up to ~1 s for the periodic IDR (key-int-max=30 @30fps).
@@ -360,6 +374,7 @@ impl RobotMedia {
             ..
         } = consumer;
         tracing::info!("removing consumer {session}");
+        self.set_viewers(|n| n.saturating_sub(1));
         forwarder.abort();
         // Drop every SSH connection riding on this session.
         tunnels.lock().unwrap().abort_all();
@@ -389,6 +404,13 @@ impl RobotMedia {
                 });
                 gst::PadProbeReturn::Remove
             });
+    }
+
+    /// Update the viewer count and open the encoder valve iff anyone is watching.
+    fn set_viewers(&self, f: impl FnOnce(usize) -> usize) {
+        let mut n = self.viewers.lock().unwrap();
+        *n = f(*n);
+        self.valve.set_property("drop", *n == 0);
     }
 
     /// Await the next raw camera frame (RGB888) from the pre-encode tee branch.
@@ -751,6 +773,56 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
+    }
+
+    /// Count buffers reaching the encoder over `window`.
+    async fn encoder_buffers(media: &RobotMedia, window: std::time::Duration) -> usize {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        let pad = media.enc.static_pad("sink").unwrap();
+        let probe = pad
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        tokio::time::sleep(window).await;
+        pad.remove_probe(probe);
+        count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn encoder_runs_only_while_watched() {
+        let media = RobotMedia::new(&[]).expect("robot media builds");
+        let window = std::time::Duration::from_millis(500);
+        assert_eq!(
+            encoder_buffers(&media, window).await,
+            0,
+            "idle robot encodes"
+        );
+        // The raw (ROS) branch is not gated.
+        tokio::time::timeout(std::time::Duration::from_secs(5), media.recv_raw_frame())
+            .await
+            .expect("raw frame while unwatched")
+            .expect("raw branch open");
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let c = media
+            .add_consumer(SessionId("viewer".into()), tx)
+            .expect("consumer builds");
+        assert!(
+            encoder_buffers(&media, window).await > 0,
+            "watched robot not encoding"
+        );
+
+        media.remove_consumer(c);
+        // Let a buffer already past the valve finish its push.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            encoder_buffers(&media, window).await,
+            0,
+            "encodes after last viewer left"
+        );
     }
 
     #[tokio::test]
