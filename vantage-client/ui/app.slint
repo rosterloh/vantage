@@ -1,0 +1,57 @@
+import { VerticalBox } from "std-widgets.slint";
+export component AppWindow inherits Window {
+    in property <image> video-frame;
+    in property <styled-text> telemetry-text: @markdown("waiting for telemetry…");
+    in property <string> status-text: "starting…";
+    in property <string> drive-text: "idle";
+    // Teleop key events, forwarded to Rust for mapping (WASD → Move, release → stop).
+    callback key-pressed-text(string);
+    callback key-released-text(string);
+    title: "Vantage";
+    preferred-width: 960px;
+    preferred-height: 540px;
+    forward-focus: input;
+    input := FocusScope {
+        key-pressed(event) => { root.key-pressed-text(event.text); accept }
+        key-released(event) => { root.key-released-text(event.text); accept }
+        // Selecting telemetry text takes the focus, so the key release never
+        // arrives here: stop instead of leaving a held move running.
+        focus-lost(reason) => { root.key-released-text(""); }
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 8px;
+            Rectangle {
+                horizontal-stretch: 7;
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.video-frame;
+                    image-fit: contain;
+                }
+                Rectangle {
+                    x: 8px;
+                    y: 8px;
+                    width: overlay.preferred-width;
+                    height: overlay.preferred-height;
+                    background: #00000066;
+                    border-radius: 8px;
+                    backdrop-blur: 12px;
+                    overlay := VerticalLayout {
+                        padding: 8px;
+                        spacing: 4px;
+                        Text { text: root.status-text; color: white; font-size: 14px; }
+                        Text { text: "Drive: " + root.drive-text; color: white; font-size: 13px; }
+                    }
+                }
+            }
+            VerticalBox {
+                horizontal-stretch: 3;
+                StyledText {
+                    text: root.telemetry-text;
+                    default-font-size: 13px;
+                    selectable: true;
+                }
+            }
+        }
+    }
+}

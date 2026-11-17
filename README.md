@@ -21,7 +21,7 @@ implementation plan.
 | `vantage-observability` | lib | Shared logging + OpenTelemetry (logs/metrics/traces) init; OTLP export when configured, stderr otherwise. |
 | `vantage-coordinator`| bin  | Rendezvous service (axum): robot registration + heartbeat, client discovery, SDP/ICE relay, fleet stats, ICE-server provisioning. |
 | `vantage-robot`      | bin  | GStreamer pipeline, telemetry producer; streams to clients over WebRTC. |
-| `vantage-client`     | bin  | Operator console: discovers robots, connects, shows live stream + telemetry. |
+| `vantage-client`     | bin  | Operator console: discovers robots, connects, shows live stream + telemetry. UI in `vantage-client/ui/*.slint`. |
 
 ## Prerequisites
 
@@ -109,6 +109,20 @@ cargo test -p vantage-protocol -p vantage-coordinator
 # Everything (requires the GStreamer packages above):
 cargo build --workspace
 cargo test --workspace
+```
+
+### With mise (optional)
+
+[`mise.toml`](mise.toml) pins `slint-lsp`, `slint-viewer` and `cargo-deb`, loads `.env`
+for every binary, and wraps the commands above and below as tasks:
+
+```bash
+mise trust && mise install
+mise run ci                    # fmt, clippy, test, as CI runs them
+mise run test:core             # no GStreamer needed
+mise run coordinator           # likewise robot, client
+mise run preview               # live-preview the client UI in slint-viewer
+mise run package:coordinator   # .deb, see deploy/systemd/README.md
 ```
 
 ## Run

@@ -25,7 +25,7 @@ extra capabilities needed). Set `VANTAGE_BIND` in the env file to change it.
 
 ## .deb package
 
-`cargo-deb` (`cargo install cargo-deb`) builds a package that installs the
+`cargo-deb` (`cargo install cargo-deb`, or `mise install`) builds a package that installs the
 binary, this systemd unit, and a `vantage` system user/env file automatically —
 see `[package.metadata.deb]` in `vantage-coordinator/Cargo.toml`:
 

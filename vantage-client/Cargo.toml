@@ -16,3 +16,6 @@ tracing.workspace = true
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 mdns-sd.workspace = true
 slint = "1.19.0"
+
+[build-dependencies]
+slint-build = "1.19.0"
