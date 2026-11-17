@@ -27,7 +27,7 @@ implementation plan.
 
 ### Rust
 
-Rust 1.90+ (`rustup` recommended).
+Rust 1.95+ (`rustup` recommended).
 
 ### System dependencies — GStreamer
 

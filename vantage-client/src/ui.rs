@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer, SharedString, Weak};
+use slint::{
+    ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, SharedString, StyledText, Weak,
+};
 use tokio::sync::mpsc;
 use vantage_protocol::ControlMsg;
 use vantage_protocol::telemetry::DeviceInfo;
@@ -9,11 +11,13 @@ use vantage_signalling::peer::VideoFrame;
 use crate::session::UiSink;
 
 slint::slint! {
-    import { VerticalBox, HorizontalBox } from "std-widgets.slint";
+    #[edition = "1.19"]
+    import { VerticalBox } from "std-widgets.slint";
     export component AppWindow inherits Window {
         in property <image> video-frame;
-        in property <string> telemetry-text: "waiting for telemetry…";
+        in property <styled-text> telemetry-text: @markdown("waiting for telemetry…");
         in property <string> status-text: "starting…";
+        in property <string> drive-text: "idle";
         // Teleop key events, forwarded to Rust for mapping (WASD → Move, release → stop).
         callback key-pressed-text(string);
         callback key-released-text(string);
@@ -24,32 +28,60 @@ slint::slint! {
         input := FocusScope {
             key-pressed(event) => { root.key-pressed-text(event.text); accept }
             key-released(event) => { root.key-released-text(event.text); accept }
-            HorizontalBox {
-                Image {
-                    source: root.video-frame;
+            // Selecting telemetry text takes the focus, so the key release never
+            // arrives here: stop instead of leaving a held move running.
+            focus-lost(reason) => { root.key-released-text(""); }
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 8px;
+                Rectangle {
                     horizontal-stretch: 7;
-                    image-fit: contain;
+                    Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: root.video-frame;
+                        image-fit: contain;
+                    }
+                    Rectangle {
+                        x: 8px;
+                        y: 8px;
+                        width: overlay.preferred-width;
+                        height: overlay.preferred-height;
+                        background: #00000066;
+                        border-radius: 8px;
+                        backdrop-blur: 12px;
+                        overlay := VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            Text { text: root.status-text; color: white; font-size: 14px; }
+                            Text { text: "Drive: " + root.drive-text; color: white; font-size: 13px; }
+                        }
+                    }
                 }
                 VerticalBox {
                     horizontal-stretch: 3;
-                    Text { text: root.status-text; font-size: 14px; }
-                    Text { text: root.telemetry-text; font-size: 13px; wrap: word-wrap; }
+                    StyledText {
+                        text: root.telemetry-text;
+                        default-font-size: 13px;
+                        selectable: true;
+                    }
                 }
             }
         }
     }
 }
 
-/// Map a pressed WASD key to a normalized teleop command; other keys ⇒ None.
-fn key_to_move(text: &str) -> Option<ControlMsg> {
-    let (linear, angular) = match text {
-        "w" | "W" => (1.0, 0.0),
-        "s" | "S" => (-1.0, 0.0),
-        "a" | "A" => (0.0, -1.0),
-        "d" | "D" => (0.0, 1.0),
+/// Map a pressed WASD key to a normalized teleop command and its on-screen
+/// label; other keys ⇒ None.
+fn key_to_move(text: &str) -> Option<(ControlMsg, &'static str)> {
+    let (linear, angular, label) = match text {
+        "w" | "W" => (1.0, 0.0, "▲ forward"),
+        "s" | "S" => (-1.0, 0.0, "▼ reverse"),
+        "a" | "A" => (0.0, -1.0, "◀ left"),
+        "d" | "D" => (0.0, 1.0, "▶ right"),
         _ => return None,
     };
-    Some(ControlMsg::Move { linear, angular })
+    Some((ControlMsg::Move { linear, angular }, label))
 }
 
 /// Wire keyboard teleop input and a 100 ms keepalive onto the control channel.
@@ -58,19 +90,27 @@ fn key_to_move(text: &str) -> Option<ControlMsg> {
 pub fn wire_control_input(ui: &AppWindow, control_tx: mpsc::UnboundedSender<ControlMsg>) {
     {
         let tx = control_tx.clone();
+        let weak = ui.as_weak();
         ui.on_key_pressed_text(move |text| {
-            if let Some(msg) = key_to_move(&text) {
+            if let Some((msg, label)) = key_to_move(&text) {
                 let _ = tx.send(msg);
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_drive_text(label.into());
+                }
             }
         });
     }
     {
         let tx = control_tx.clone();
+        let weak = ui.as_weak();
         ui.on_key_released_text(move |_| {
             let _ = tx.send(ControlMsg::Move {
                 linear: 0.0,
                 angular: 0.0,
             });
+            if let Some(ui) = weak.upgrade() {
+                ui.set_drive_text("idle".into());
+            }
         });
     }
     // Keepalive so an idle hold does not trip the watchdog. The timer lives on the
@@ -109,23 +149,44 @@ impl UiSink for SlintSink {
             .upgrade_in_event_loop(move |ui| ui.set_video_frame(Image::from_rgba8(buf)));
     }
     fn telemetry(&self, info: &DeviceInfo) {
-        let text: SharedString = format!(
-            "CPU {:.1}%\nMem {}/{} MB\nTemps {}\nUptime {}s",
+        let md = format!(
+            "- **CPU** {:.1}%\n- **Mem** {}/{} MB\n- **Temps** {}\n- **Uptime** {}s",
             info.cpu_percent,
             info.mem_used_mb,
             info.mem_total_mb,
             info.temps.len(),
             info.uptime_s
-        )
-        .into();
-        let _ = self
-            .ui
-            .upgrade_in_event_loop(move |ui| ui.set_telemetry_text(text));
+        );
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            let text =
+                StyledText::from_markdown(&md).unwrap_or_else(|_| StyledText::from_plain_text(&md));
+            ui.set_telemetry_text(text);
+        });
     }
     fn status(&self, text: &str) {
         let text: SharedString = text.to_string().into();
         let _ = self
             .ui
             .upgrade_in_event_loop(move |ui| ui.set_status_text(text));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wasd_maps_to_move_and_label() {
+        let (msg, label) = key_to_move("w").unwrap();
+        assert!(
+            matches!(msg, ControlMsg::Move { linear, angular } if linear == 1.0 && angular == 0.0)
+        );
+        assert_eq!(label, "▲ forward");
+        assert!(key_to_move("x").is_none());
+    }
+
+    #[test]
+    fn telemetry_markdown_parses() {
+        assert!(StyledText::from_markdown("- **CPU** 1.0%\n- **Mem** 1/2 MB").is_ok());
     }
 }
