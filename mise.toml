@@ -1,0 +1,70 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+# Dev tools and tasks. Rust comes from rustup; GStreamer and fontconfig from the
+# system packages in the README.
+
+[tool_alias]
+slint-lsp = "github:slint-ui/slint"
+slint-viewer = "github:slint-ui/slint"
+
+# Keep these in step with the `slint` crate in vantage-client/Cargo.toml.
+[tools.slint-lsp]
+version = "1.19.0"
+strip_components = 1
+[tools.slint-lsp.platforms]
+linux-x64 = { asset_pattern = "slint-lsp-linux.tar.gz" }
+linux-arm64 = { asset_pattern = "slint-lsp-aarch64-unknown-linux-gnu.tar.gz" }
+macos-x64 = { asset_pattern = "slint-lsp-macos.tar.gz" }
+macos-arm64 = { asset_pattern = "slint-lsp-macos.tar.gz" }
+windows-x64 = { asset_pattern = "slint-lsp-windows-x86_64.zip" }
+
+[tools.slint-viewer]
+version = "1.19.0"
+strip_components = 1
+[tools.slint-viewer.platforms]
+linux-x64 = { asset_pattern = "slint-viewer-linux.tar.gz" }
+linux-arm64 = { asset_pattern = "slint-viewer-aarch64-unknown-linux-gnu.tar.gz" }
+macos-x64 = { asset_pattern = "slint-viewer-macos.tar.gz" }
+macos-arm64 = { asset_pattern = "slint-viewer-macos.tar.gz" }
+windows-x64 = { asset_pattern = "slint-viewer-windows-x86_64.zip" }
+
+[tools]
+"cargo:cargo-deb" = "3.8.0"
+
+[env]
+RUST_LOG = { default = "info" }
+VANTAGE_COORDINATOR = { default = "ws://localhost:8080" }
+# Optional, gitignored; gives the robot and client the same .env as the coordinator.
+_.file = { path = ".env", redact = true }
+
+[tasks.coordinator]
+description = "Run the coordinator (binds VANTAGE_BIND, default 0.0.0.0:8080)"
+run = "cargo run -p vantage-coordinator"
+
+[tasks.robot]
+description = "Run the robot; registers with VANTAGE_COORDINATOR"
+run = "cargo run -p vantage-robot"
+
+[tasks.client]
+description = "Run the operator client; discovers robots via VANTAGE_COORDINATOR or mDNS"
+run = "cargo run -p vantage-client"
+
+[tasks.preview]
+description = "Live-preview the client UI (vantage-client/ui) in slint-viewer, reloading on save"
+run = "slint-viewer --auto-reload vantage-client/ui"
+
+[tasks.ci]
+description = "Run the CI checks locally: fmt, clippy, test"
+env = { RUSTFLAGS = "-D warnings" }
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace",
+]
+
+[tasks."test:core"]
+description = "Test protocol and coordinator only (no GStreamer needed)"
+run = "cargo test -p vantage-protocol -p vantage-coordinator"
+
+[tasks."package:coordinator"]
+description = "Build the coordinator .deb (binary, systemd unit, vantage user) into target/debian"
+run = "cargo deb -p vantage-coordinator"
