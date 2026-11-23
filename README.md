@@ -81,6 +81,16 @@ libcamera camera ID, not the sensor name shown in brackets — run
 
 `VANTAGE_LIBCAMERA_NAME=/base/axi/pcie@1000120000/rp1/i2c@88000/imx708@1a`
 
+**A camera already published on ROS 2** (e.g. a RealSense via `realsense2_camera`):
+build with `--features ros` from a sourced Lyrical env and set
+`VANTAGE_VIDEO_SOURCE=ros` and `VANTAGE_ROS_IMAGE_TOPIC` (default `image_raw`). The
+robot subscribes best-effort, depth 1, and streams the topic at its own size;
+`rgb8`, `bgr8`, `rgba8`, `bgra8`, `mono8`, `yuv422` and `yuv422_yuy2` are accepted.
+Nothing else has to give up the camera.
+
+`VANTAGE_MAX_FPS` caps the streamed frame rate for any source. Frames are dropped
+before conversion and encoding, so a lower cap saves robot CPU as well as bandwidth.
+
 Verify the install:
 
 ```bash

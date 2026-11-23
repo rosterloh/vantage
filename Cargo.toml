@@ -32,3 +32,12 @@ opentelemetry-otlp = { version = "0.33.1", default-features = false, features = 
 opentelemetry-appender-tracing = "0.33.1"
 opentelemetry-semantic-conventions = "0.33.1"
 tracing-opentelemetry = "0.34.0"
+
+# vantage-robot's `ros` feature. rosterloh's ros2-rust integration branches,
+# the same revs as eit_robot's rebot_b601_driver: upstream plus ros2_rust #719,
+# without which a failed take ends `spin` and a callback error leaves the wait
+# set unregistered under rmw_zenoh. Pinned by rev because each rebuild rewrites
+# the branch. Drop both once a crates.io rclrs contains #719.
+[patch.crates-io]
+rclrs = { git = "https://github.com/rosterloh/ros2_rust", rev = "95a18ec7b92cc9f46dee634b65200c99853fe2f3" }
+rosidl_runtime_rs = { git = "https://github.com/rosterloh/rosidl_runtime_rs", rev = "2311b51c7e5efb882790adb3c1c8f9349a7a1118" }

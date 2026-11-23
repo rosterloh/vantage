@@ -1,7 +1,9 @@
 //! Robot-side media engine: ONE pipeline that captures and H.264-encodes the
 //! camera exactly once, then fans the encoded RTP out via `rtptee` to one
 //! `webrtcbin` per connected client (`Consumer`). The raw pre-encode branch
-//! (RawFrame) is unchanged from 4a and feeds the ROS bridge.
+//! (RawFrame) is unchanged from 4a and feeds the ROS bridge. An external source
+//! (`VANTAGE_VIDEO_SOURCE=ros`) is fed through `FrameInput` and has no raw branch:
+//! its frames already came from ROS.
 
 use anyhow::{Context, Result};
 use gstreamer as gst;
@@ -38,31 +40,63 @@ pub struct RobotMedia {
     viewers: std::sync::Mutex<usize>,
     ice_servers: Vec<IceServer>,
     raw_frames_rx: tokio::sync::Mutex<mpsc::Receiver<RawFrame>>,
+    /// Set when the host pushes the frames (`VANTAGE_VIDEO_SOURCE=ros`).
+    input: Option<FrameInput>,
     /// SSH tunnels; `None` (the default) closes every operator-created channel.
     ssh: Option<SshTunnelConfig>,
 }
 
 impl RobotMedia {
     pub fn new(ice_servers: &[IceServer]) -> Result<Self> {
+        let kind = std::env::var("VANTAGE_VIDEO_SOURCE").unwrap_or_else(|_| "test".into());
+        let max_fps = std::env::var("VANTAGE_MAX_FPS")
+            .ok()
+            .map(|v| parse_max_fps(&v))
+            .transpose()?;
+        Self::with_source(ice_servers, &kind, max_fps)
+    }
+
+    fn with_source(ice_servers: &[IceServer], kind: &str, max_fps: Option<u32>) -> Result<Self> {
         gst::init()?;
         let pipeline = gst::Pipeline::new();
 
         // source → videoconvert → I420 caps(640x480@30) → tee  (verbatim from 4a)
-        let source = build_source()?;
+        let source = build_source(kind)?;
+        let input = source
+            .clone()
+            .downcast::<gst_app::AppSrc>()
+            .ok()
+            .map(FrameInput::new);
+        // Drops frames right after the source, so a capped rate saves conversion and
+        // encoding too, not just bandwidth.
+        let rate = max_fps
+            .map(|n| {
+                tracing::info!("video rate capped at {n} fps");
+                gst::ElementFactory::make("videorate")
+                    .property("drop-only", true)
+                    .property("max-rate", i32::try_from(n)?)
+                    .build()
+                    .context("videorate")
+            })
+            .transpose()?;
         let srcconvert = gst::ElementFactory::make("videoconvert").build()?;
+        // Force I420 (4:2:0): cameras often negotiate YUYV (4:2:2), which x264enc
+        // baseline rejects. I420 also converts cleanly to RGB on the raw branch.
+        let mut caps = gst::Caps::builder("video/x-raw").field("format", "I420");
+        // Device sources negotiate 640x480@30 at the camera. An external source keeps
+        // the publisher's size and rate: scaling would cost CPU and distort 16:9.
+        let fps = if input.is_none() {
+            caps = caps.field("width", 640i32).field("height", 480i32);
+            Some(max_fps.map_or(30, |n| n.min(30)))
+        } else {
+            // videorate passes variable-rate (0/1) input through unless asked for a rate.
+            max_fps
+        };
+        if let Some(fps) = fps {
+            caps = caps.field("framerate", gst::Fraction::new(i32::try_from(fps)?, 1));
+        }
         let srccaps = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("video/x-raw")
-                    // Force I420 (4:2:0): cameras often negotiate YUYV (4:2:2), which
-                    // x264enc baseline rejects. I420 also converts cleanly to RGB on
-                    // the raw branch.
-                    .field("format", "I420")
-                    .field("width", 640i32)
-                    .field("height", 480i32)
-                    .field("framerate", gst::Fraction::new(30, 1))
-                    .build(),
-            )
+            .property("caps", caps.build())
             .build()?;
         let tee = gst::ElementFactory::make("tee").name("t").build()?;
 
@@ -115,7 +149,6 @@ impl RobotMedia {
 
         // raw branch: tee → queue → videoconvert → RGB appsink → RawFrame  (verbatim from 4a)
         let (raw_tx, raw_frames_rx) = mpsc::channel::<RawFrame>(crate::peer::FRAME_QUEUE_DEPTH);
-        let (rqueue, rconvert, rawsink_el) = build_raw_branch(&raw_tx)?;
 
         pipeline.add_many([
             &source,
@@ -129,15 +162,23 @@ impl RobotMedia {
             &pay,
             &rtpcaps,
             &rtptee,
-            &rqueue,
-            &rconvert,
-            &rawsink_el,
         ])?;
-        gst::Element::link_many([&source, &srcconvert, &srccaps, &tee])?;
+        let mut head = vec![&source];
+        if let Some(rate) = &rate {
+            pipeline.add(rate)?;
+            head.push(rate);
+        }
+        head.extend([&srcconvert, &srccaps, &tee]);
+        gst::Element::link_many(head)?;
         gst::Element::link_many([&equeue, &valve, &enc, &parse, &pay, &rtpcaps, &rtptee])?;
         link_tee(&tee, &equeue)?;
-        gst::Element::link_many([&rqueue, &rconvert, &rawsink_el])?;
-        link_tee(&tee, &rqueue)?;
+        // Without the raw branch raw_tx drops here, so recv_raw_frame returns None.
+        if input.is_none() {
+            let (rqueue, rconvert, rawsink_el) = build_raw_branch(&raw_tx)?;
+            pipeline.add_many([&rqueue, &rconvert, &rawsink_el])?;
+            gst::Element::link_many([&rqueue, &rconvert, &rawsink_el])?;
+            link_tee(&tee, &rqueue)?;
+        }
 
         pipeline.set_state(gst::State::Playing)?;
 
@@ -149,6 +190,7 @@ impl RobotMedia {
             viewers: std::sync::Mutex::new(0),
             ice_servers: ice_servers.to_vec(),
             raw_frames_rx: tokio::sync::Mutex::new(raw_frames_rx),
+            input,
             ssh: None,
         })
     }
@@ -413,7 +455,13 @@ impl RobotMedia {
         self.valve.set_property("drop", *n == 0);
     }
 
+    /// The host-fed input when `VANTAGE_VIDEO_SOURCE=ros`, else `None`.
+    pub fn frame_input(&self) -> Option<FrameInput> {
+        self.input.clone()
+    }
+
     /// Await the next raw camera frame (RGB888) from the pre-encode tee branch.
+    /// `None` at once for an external source, which has no raw branch.
     pub async fn recv_raw_frame(&self) -> Option<RawFrame> {
         self.raw_frames_rx.lock().await.recv().await
     }
@@ -421,6 +469,144 @@ impl RobotMedia {
     /// Set the pipeline to Null, releasing the camera device and encoder threads.
     pub fn shutdown(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// `VANTAGE_MAX_FPS`: a whole number of frames per second, at least 1.
+fn parse_max_fps(value: &str) -> Result<u32> {
+    let n: u32 = value
+        .trim()
+        .parse()
+        .with_context(|| format!("VANTAGE_MAX_FPS={value:?} is not a whole number"))?;
+    anyhow::ensure!(n > 0, "VANTAGE_MAX_FPS must be at least 1");
+    Ok(n)
+}
+
+/// Packed, single-plane pixel layouts `FrameInput` accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgb,
+    Bgr,
+    Rgba,
+    Bgra,
+    Gray8,
+    Yuy2,
+    Uyvy,
+}
+
+impl PixelFormat {
+    pub fn bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::Gray8 => 1,
+            Self::Yuy2 | Self::Uyvy => 2,
+            Self::Rgb | Self::Bgr => 3,
+            Self::Rgba | Self::Bgra => 4,
+        }
+    }
+
+    fn video_format(self) -> gst_video::VideoFormat {
+        use gst_video::VideoFormat as F;
+        match self {
+            Self::Rgb => F::Rgb,
+            Self::Bgr => F::Bgr,
+            Self::Rgba => F::Rgba,
+            Self::Bgra => F::Bgra,
+            Self::Gray8 => F::Gray8,
+            Self::Yuy2 => F::Yuy2,
+            Self::Uyvy => F::Uyvy,
+        }
+    }
+}
+
+/// Geometry of one pushed frame. `stride` is bytes per row (ROS `step`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameLayout {
+    pub format: PixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+}
+
+impl FrameLayout {
+    /// Bytes a frame with this layout must hold. Checked before the pipeline reads
+    /// `height` rows of `stride` bytes from data it did not produce.
+    fn required_len(&self) -> Result<usize> {
+        anyhow::ensure!(
+            self.width > 0 && self.height > 0,
+            "empty frame {}x{}",
+            self.width,
+            self.height
+        );
+        let row = u64::from(self.width) * u64::from(self.format.bytes_per_pixel());
+        anyhow::ensure!(
+            u64::from(self.stride) >= row,
+            "stride {} shorter than a {}-byte row",
+            self.stride,
+            row
+        );
+        Ok(usize::try_from(
+            u64::from(self.stride) * u64::from(self.height),
+        )?)
+    }
+}
+
+/// Pushes host-owned frames into the pipeline (`VANTAGE_VIDEO_SOURCE=ros`).
+/// Cheap to clone; push from any thread.
+#[derive(Clone)]
+pub struct FrameInput {
+    src: gst_app::AppSrc,
+    layout: std::sync::Arc<std::sync::Mutex<Option<FrameLayout>>>,
+}
+
+impl FrameInput {
+    fn new(src: gst_app::AppSrc) -> Self {
+        Self {
+            src,
+            layout: Default::default(),
+        }
+    }
+
+    /// Push one frame without copying it: the buffer owns `data` until the pipeline
+    /// is done with it. Never blocks; a backed-up pipeline drops its oldest frame.
+    pub fn push<T: AsRef<[u8]> + Send + 'static>(
+        &self,
+        layout: FrameLayout,
+        data: T,
+    ) -> Result<()> {
+        let need = layout.required_len()?;
+        let have = data.as_ref().len();
+        anyhow::ensure!(
+            have >= need,
+            "{}x{} frame with stride {} needs {need} bytes, got {have}",
+            layout.width,
+            layout.height,
+            layout.stride
+        );
+        let format = layout.format.video_format();
+        {
+            let mut last = self.layout.lock().unwrap();
+            if *last != Some(layout) {
+                // 0/1: variable rate; buffers carry arrival timestamps (do-timestamp).
+                let info = gst_video::VideoInfo::builder(format, layout.width, layout.height)
+                    .fps(gst::Fraction::new(0, 1))
+                    .build()?;
+                self.src.set_caps(Some(&info.to_caps()?));
+                *last = Some(layout);
+            }
+        }
+        let mut buffer = gst::Buffer::from_slice(data);
+        // The publisher's row stride, which can differ from GStreamer's default padding.
+        gst_video::VideoMeta::add_full(
+            buffer.get_mut().expect("new buffer is writable"),
+            gst_video::VideoFrameFlags::empty(),
+            format,
+            layout.width,
+            layout.height,
+            &[0],
+            &[i32::try_from(layout.stride)?],
+        )?;
+        self.src.push_buffer(buffer)?;
+        Ok(())
     }
 }
 
@@ -660,9 +846,10 @@ fn link_tee(tee: &gst::Element, downstream: &gst::Element) -> Result<()> {
 /// `VANTAGE_VIDEO_SOURCE=libcamera` → libcamerasrc (Raspberry Pi CSI camera modules,
 /// which the legacy V4L2 stack can't drive; `VANTAGE_LIBCAMERA_NAME` selects a camera
 /// by name when more than one is attached, default picks the first detected camera);
+/// `VANTAGE_VIDEO_SOURCE=ros` → appsrc the host feeds through `RobotMedia::frame_input`
+/// (vantage-robot's ROS image subscriber);
 /// anything else (default) → videotestsrc SMPTE pattern.
-fn build_source() -> Result<gst::Element> {
-    let kind = std::env::var("VANTAGE_VIDEO_SOURCE").unwrap_or_else(|_| "test".into());
+fn build_source(kind: &str) -> Result<gst::Element> {
     if kind == "camera" {
         let dev = std::env::var("VANTAGE_CAMERA_DEVICE").unwrap_or_else(|_| "/dev/video0".into());
         tracing::info!("video source: camera {dev}");
@@ -683,6 +870,17 @@ fn build_source() -> Result<gst::Element> {
         builder.build().context(
             "libcamerasrc — Raspberry Pi CSI camera source (install gstreamer1.0-libcamera)",
         )
+    } else if kind == "ros" {
+        tracing::info!("video source: frames pushed from ROS");
+        // Two frames of slack, oldest dropped: a slow encoder adds no latency.
+        Ok(gst_app::AppSrc::builder()
+            .is_live(true)
+            .format(gst::Format::Time)
+            .do_timestamp(true)
+            .max_buffers(2)
+            .leaky_type(gst_app::AppLeakyType::Downstream)
+            .build()
+            .upcast())
     } else {
         tracing::info!("video source: test pattern");
         gst::ElementFactory::make("videotestsrc")
@@ -724,6 +922,125 @@ mod tests {
             }
             other => panic!("expected an Offer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn frame_layout_checks_geometry() {
+        let layout = |width, stride| FrameLayout {
+            format: PixelFormat::Rgb,
+            width,
+            height: 2,
+            stride,
+        };
+        assert_eq!(layout(4, 12).required_len().unwrap(), 24);
+        assert_eq!(layout(4, 16).required_len().unwrap(), 32);
+        assert!(
+            layout(4, 11).required_len().is_err(),
+            "stride shorter than a row"
+        );
+        assert!(layout(0, 0).required_len().is_err(), "empty frame");
+    }
+
+    /// Pushed frames reach the encoder at their own size, with a padded stride,
+    /// and a frame shorter than its layout is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_source_encodes_pushed_frames() {
+        let media = RobotMedia::with_source(&[], "ros", None).expect("robot media builds");
+        let input = media.frame_input().expect("external source has an input");
+        assert!(media.recv_raw_frame().await.is_none(), "no raw branch");
+
+        let layout = FrameLayout {
+            format: PixelFormat::Rgb,
+            width: 848,
+            height: 480,
+            stride: 848 * 3 + 16,
+        };
+        assert!(
+            input.push(layout, vec![0u8; 100]).is_err(),
+            "short frame accepted"
+        );
+        let pusher = Pusher::start(input, layout);
+
+        // Open the valve as a viewer would, without needing webrtcbin's libnice.
+        media.set_viewers(|_| 1);
+        let encoded = encoder_buffers(&media, std::time::Duration::from_millis(1000)).await;
+        pusher.stop();
+        assert!(encoded > 0, "pushed frames never reached the encoder");
+        let caps = media
+            .enc
+            .static_pad("sink")
+            .unwrap()
+            .current_caps()
+            .unwrap();
+        let s = caps.structure(0).unwrap();
+        assert_eq!(s.get::<i32>("width").unwrap(), 848);
+        assert_eq!(s.get::<i32>("height").unwrap(), 480);
+    }
+
+    /// Pushes `layout`-sized frames at ~30 fps until stopped.
+    struct Pusher {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Pusher {
+        fn start(input: FrameInput, layout: FrameLayout) -> Self {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = stop.clone();
+            let len = (layout.stride * layout.height) as usize;
+            let thread = std::thread::spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    input.push(layout, vec![128u8; len]).expect("push");
+                    std::thread::sleep(std::time::Duration::from_millis(33));
+                }
+            });
+            Self { stop, thread }
+        }
+
+        fn stop(self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn max_fps_must_be_a_positive_whole_number() {
+        assert_eq!(parse_max_fps(" 10 ").unwrap(), 10);
+        assert!(parse_max_fps("0").is_err());
+        assert!(parse_max_fps("7.5").is_err());
+    }
+
+    /// A 30 fps source capped at 10 encodes about 10 frames a second, for both a
+    /// device-style source and a pushed one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_fps_drops_frames_before_the_encoder() {
+        let window = std::time::Duration::from_secs(2);
+        let in_range = |n: usize| (14..=26).contains(&n);
+
+        let media = RobotMedia::with_source(&[], "test", Some(10)).expect("robot media builds");
+        media.set_viewers(|_| 1);
+        let n = encoder_buffers(&media, window).await;
+        assert!(
+            in_range(n),
+            "test source: {n} frames in 2 s at a 10 fps cap"
+        );
+
+        let media = RobotMedia::with_source(&[], "ros", Some(10)).expect("robot media builds");
+        let layout = FrameLayout {
+            format: PixelFormat::Rgb,
+            width: 320,
+            height: 240,
+            stride: 320 * 3,
+        };
+        let pusher = Pusher::start(media.frame_input().unwrap(), layout);
+        media.set_viewers(|_| 1);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let n = encoder_buffers(&media, window).await;
+        pusher.stop();
+        assert!(
+            in_range(n),
+            "pushed source: {n} frames in 2 s at a 10 fps cap"
+        );
     }
 
     #[tokio::test]
