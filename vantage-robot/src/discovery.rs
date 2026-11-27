@@ -105,6 +105,7 @@ async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStr
     let control_epoch = Instant::now();
     let mut dc_open = false;
     let mut sampler = Sampler::new();
+    let metrics = crate::metrics::RobotMetrics::new();
     let mut watchdog_tick = tokio::time::interval(Duration::from_millis(100));
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
 
@@ -159,6 +160,7 @@ async fn handle_direct_client(media: Arc<RobotMedia>, stream: tokio::net::TcpStr
                 if dc_open {
                     let bytes = vantage_protocol::codec::encode(&sampler.sample())?;
                     consumer.send_data(&bytes)?;
+                    metrics.record_stream(&consumer, "lan");
                 }
             }
         }

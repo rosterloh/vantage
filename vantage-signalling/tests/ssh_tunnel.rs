@@ -1,7 +1,8 @@
 //! End-to-end SSH tunnel over a real in-process WebRTC session: a robot
 //! `RobotMedia` consumer and an operator `Peer` signal each other directly, the
 //! operator opens an `ssh` channel, and the robot bridges it to a local TCP echo
-//! server standing in for `sshd`.
+//! server standing in for `sshd`. Also checks the connection metrics both sides
+//! report over the same session.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,4 +150,43 @@ async fn selected_candidate_types_are_reported_once_connected() {
     // In-process loopback: both ends can only be host candidates.
     let types = peer.selected_candidate_types().await;
     assert_eq!(types, Some(("host".into(), "host".into())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_reports_checkpoints_and_rtp_stats() {
+    let media = RobotMedia::new(&[]).expect("robot media builds");
+    let (consumer, peer) = connect(&media).await;
+
+    assert!(
+        peer.wait_first_frame(Duration::from_secs(10)).await,
+        "first frame decoded within 10s"
+    );
+    let m = peer.marks();
+    let (ice, dtls, frame) = (
+        m.ice_connected.expect("ice mark"),
+        m.dtls_connected.expect("dtls mark"),
+        m.first_frame.expect("first frame mark"),
+    );
+    assert!(ice <= dtls && dtls <= frame, "{m:?}");
+
+    // RTCP receiver reports go out every few seconds; give the robot one.
+    let robot = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            consumer.sample_rtp_stats(move |s| {
+                let _ = tx.send(s);
+            });
+            if let Ok(s) = rx.await
+                && s.rtt_s.is_some()
+            {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("robot sees an RTT within 15s");
+    assert!(robot.bytes > 0, "{robot:?}");
+    let client = peer.rtp_stats().await.expect("client stats");
+    assert!(client.bytes > 0, "{client:?}");
 }

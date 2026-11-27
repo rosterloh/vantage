@@ -4,8 +4,9 @@
 
 use vantage_observability::opentelemetry::KeyValue;
 use vantage_observability::opentelemetry::global;
-use vantage_observability::opentelemetry::metrics::{Counter, Gauge};
+use vantage_observability::opentelemetry::metrics::{Counter, Gauge, Histogram};
 use vantage_protocol::telemetry::DeviceInfo;
+use vantage_signalling::robot_media::Consumer;
 
 /// Cloneable handle to the robot's metric instruments (each wraps an `Arc`).
 #[derive(Clone)]
@@ -16,6 +17,8 @@ pub struct RobotMetrics {
     uptime_s: Gauge<u64>,
     temperature: Gauge<f64>,
     frames_published: Counter<u64>,
+    stream_rtt: Histogram<f64>,
+    stream_estimated_bitrate: Histogram<u64>,
 }
 
 impl RobotMetrics {
@@ -43,6 +46,16 @@ impl RobotMetrics {
                 .u64_counter("vantage.robot.frames_published")
                 .with_description("Raw camera frames drained from the capture engine")
                 .build(),
+            stream_rtt: m
+                .f64_histogram("vantage.robot.stream_rtt")
+                .with_unit("ms")
+                .with_description("Video RTT per viewer, from RTCP receiver reports")
+                .build(),
+            stream_estimated_bitrate: m
+                .u64_histogram("vantage.robot.stream_estimated_bitrate")
+                .with_unit("kbit/s")
+                .with_description("GCC bandwidth estimate per viewer")
+                .build(),
         }
     }
 
@@ -58,6 +71,22 @@ impl RobotMetrics {
                 &[KeyValue::new("sensor", t.label.clone())],
             );
         }
+    }
+
+    /// Sample one viewer's stream. `path` is `coordinator` or `lan`. Never waits:
+    /// the RTT lands when webrtcbin answers.
+    pub fn record_stream(&self, consumer: &Consumer, path: &'static str) {
+        let attrs = [KeyValue::new("path", path)];
+        if let Some(bps) = consumer.estimated_bitrate() {
+            self.stream_estimated_bitrate
+                .record(bps as u64 / 1000, &attrs);
+        }
+        let rtt = self.stream_rtt.clone();
+        consumer.sample_rtp_stats(move |s| {
+            if let Some(r) = s.rtt_s {
+                rtt.record(r * 1000.0, &attrs);
+            }
+        });
     }
 
     pub fn frame_published(&self) {

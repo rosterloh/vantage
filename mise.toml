@@ -61,6 +61,10 @@ run = [
   "cargo test --workspace",
 ]
 
+[tasks.netem]
+description = "Add or remove netem delay on the coordinator port (on [ms] [port] [iface] | off | show)"
+run = "scripts/netem-delay.sh"
+
 [tasks."test:core"]
 description = "Test protocol and coordinator only (no GStreamer needed)"
 run = "cargo test -p vantage-protocol -p vantage-coordinator"

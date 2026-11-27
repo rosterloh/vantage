@@ -288,6 +288,11 @@ async fn main() -> Result<()> {
             _ = telemetry_tick.tick() => {
                 let info = sampler.sample();
                 metrics.record_device(&info);
+                for (s, c) in &consumers {
+                    if dc_open.contains(s) {
+                        metrics.record_stream(c, "coordinator");
+                    }
+                }
                 match codec::encode(&info) {
                     Ok(bytes) => {
                         for (s, c) in &consumers {
