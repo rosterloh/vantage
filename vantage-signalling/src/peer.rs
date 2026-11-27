@@ -67,6 +67,25 @@ pub(crate) fn try_push_frame<T>(
     }
 }
 
+/// When this peer reached each connection checkpoint, first time only.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct PeerMarks {
+    pub ice_connected: Option<std::time::Instant>,
+    /// Peer connection `connected`: ICE and DTLS both done.
+    pub dtls_connected: Option<std::time::Instant>,
+    pub first_frame: Option<std::time::Instant>,
+}
+
+type Marks = Arc<tokio::sync::watch::Sender<PeerMarks>>;
+
+/// Stamp one checkpoint on first arrival. Safe from GStreamer threads (never blocks).
+fn mark(marks: &Marks, field: fn(&mut PeerMarks) -> &mut Option<std::time::Instant>) {
+    marks.send_if_modified(|m| {
+        let slot = field(m);
+        slot.is_none() && slot.replace(std::time::Instant::now()).is_none()
+    });
+}
+
 pub struct Peer {
     pub pipeline: gst::Pipeline,
     pub webrtcbin: gst::Element,
@@ -80,6 +99,7 @@ pub struct Peer {
     frames_tx: mpsc::Sender<VideoFrame>,
     control_seq: std::sync::atomic::AtomicU64,
     control_epoch: std::time::Instant,
+    marks: Marks,
 }
 
 impl Peer {
@@ -102,6 +122,8 @@ impl Peer {
         wire_local_ice(&webrtcbin, &tx);
 
         let (frames_tx, frames_rx) = mpsc::channel::<VideoFrame>(FRAME_QUEUE_DEPTH);
+        let marks: Marks = Arc::new(tokio::sync::watch::channel(PeerMarks::default()).0);
+        wire_marks(&webrtcbin, &marks);
 
         let peer = Self {
             pipeline,
@@ -114,6 +136,7 @@ impl Peer {
             frames_tx: frames_tx.clone(),
             control_seq: std::sync::atomic::AtomicU64::new(0),
             control_epoch: std::time::Instant::now(),
+            marks,
         };
 
         // The SCTP transport is only available once the pipeline is PLAYING; the decode
@@ -136,7 +159,12 @@ impl Peer {
                 }
                 None
             });
-        wire_video_receiver(&peer.pipeline, &peer.webrtcbin, &peer.frames_tx);
+        wire_video_receiver(
+            &peer.pipeline,
+            &peer.webrtcbin,
+            &peer.frames_tx,
+            &peer.marks,
+        );
 
         Ok(peer)
     }
@@ -264,13 +292,26 @@ impl Peer {
     }
 
     async fn stats_candidate_types(&self) -> Option<(String, String)> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let promise = gst::Promise::with_change_func(move |reply| {
-            let _ = tx.send(reply.ok().flatten().and_then(selected_candidate_types));
-        });
-        self.webrtcbin
-            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-        rx.await.ok().flatten()
+        let stats = get_stats(&self.webrtcbin).await?;
+        selected_candidate_types(&stats)
+    }
+
+    /// Connection checkpoints reached so far.
+    pub fn marks(&self) -> PeerMarks {
+        *self.marks.borrow()
+    }
+
+    /// Wait up to `limit` for the first decoded video frame; true if it arrived.
+    pub async fn wait_first_frame(&self, limit: std::time::Duration) -> bool {
+        let mut rx = self.marks.subscribe();
+        tokio::time::timeout(limit, rx.wait_for(|m| m.first_frame.is_some()))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    }
+
+    /// Cumulative video RTP counters for this peer's inbound stream.
+    pub async fn rtp_stats(&self) -> Option<RtpStats> {
+        get_stats(&self.webrtcbin).await.map(|s| rtp_stats(&s))
     }
 
     /// Tear down the decode pipeline (sets it to Null).
@@ -285,6 +326,87 @@ impl Drop for Peer {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+/// Ask webrtcbin for a stats snapshot; `f` runs on a GStreamer thread with it.
+pub(crate) fn request_stats(
+    webrtcbin: &gst::Element,
+    f: impl FnOnce(Option<&gst::StructureRef>) + Send + 'static,
+) {
+    let promise = gst::Promise::with_change_func(move |reply| f(reply.ok().flatten()));
+    webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+}
+
+/// One webrtcbin `get-stats` snapshot.
+async fn get_stats(webrtcbin: &gst::Element) -> Option<gst::Structure> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    request_stats(webrtcbin, move |s| {
+        let _ = tx.send(s.map(|s| s.to_owned()));
+    });
+    rx.await.ok().flatten()
+}
+
+/// Video RTP counters from one stats snapshot, summed over this peer's streams.
+/// Bytes and packets are cumulative; diff two snapshots for a rate.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct RtpStats {
+    /// Bytes sent (robot) or received (client).
+    pub bytes: u64,
+    /// Packets lost, as reported by the receiver (RTCP) or counted locally.
+    pub packets_lost: i64,
+    pub jitter_s: Option<f64>,
+    /// Round-trip time from RTCP receiver reports; only the sender sees it.
+    pub rtt_s: Option<f64>,
+}
+
+/// Pull `RtpStats` from a webrtcbin stats structure. Field names follow the W3C
+/// stats spec as webrtcbin spells them (kebab-case).
+pub fn rtp_stats(stats: &gst::StructureRef) -> RtpStats {
+    let mut out = RtpStats::default();
+    for (_, v) in stats.iter() {
+        let Ok(s) = v.get::<gst::Structure>() else {
+            continue;
+        };
+        let Ok(kind) = s.get::<gst_webrtc::WebRTCStatsType>("type") else {
+            continue;
+        };
+        match kind {
+            gst_webrtc::WebRTCStatsType::InboundRtp => {
+                out.bytes += s.get::<u64>("bytes-received").unwrap_or(0);
+                out.packets_lost += s.get::<i64>("packets-lost").unwrap_or(0);
+                out.jitter_s = s.get::<f64>("jitter").ok().or(out.jitter_s);
+            }
+            gst_webrtc::WebRTCStatsType::OutboundRtp => {
+                out.bytes += s.get::<u64>("bytes-sent").unwrap_or(0);
+            }
+            gst_webrtc::WebRTCStatsType::RemoteInboundRtp => {
+                out.packets_lost += s.get::<i64>("packets-lost").unwrap_or(0);
+                out.jitter_s = s.get::<f64>("jitter").ok().or(out.jitter_s);
+                out.rtt_s = s.get::<f64>("round-trip-time").ok().or(out.rtt_s);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Stamp ICE and DTLS checkpoints from webrtcbin's state notifications.
+fn wire_marks(webrtcbin: &gst::Element, marks: &Marks) {
+    let m = marks.clone();
+    webrtcbin.connect_notify(Some("ice-connection-state"), move |bin, _| {
+        use gst_webrtc::WebRTCICEConnectionState as S;
+        let state = bin.property::<S>("ice-connection-state");
+        if matches!(state, S::Connected | S::Completed) {
+            mark(&m, |p| &mut p.ice_connected);
+        }
+    });
+    let m = marks.clone();
+    webrtcbin.connect_notify(Some("connection-state"), move |bin, _| {
+        let state = bin.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+        if state == gst_webrtc::WebRTCPeerConnectionState::Connected {
+            mark(&m, |p| &mut p.dtls_connected);
+        }
+    });
 }
 
 /// Follow webrtcbin stats from the transport's `selected-candidate-pair-id` to the
@@ -421,14 +543,16 @@ fn wire_video_receiver(
     pipeline: &gst::Pipeline,
     webrtcbin: &gst::Element,
     frames_tx: &mpsc::Sender<VideoFrame>,
+    marks: &Marks,
 ) {
     let pipeline = pipeline.clone();
     let frames_tx = frames_tx.clone();
+    let marks = marks.clone();
     webrtcbin.connect_pad_added(move |_bin, pad| {
         if pad.direction() != gst::PadDirection::Src {
             return;
         }
-        if let Err(e) = build_decode_branch(&pipeline, pad, &frames_tx) {
+        if let Err(e) = build_decode_branch(&pipeline, pad, &frames_tx, &marks) {
             tracing::error!("failed to build decode branch: {e}");
         }
     });
@@ -438,6 +562,7 @@ fn build_decode_branch(
     pipeline: &gst::Pipeline,
     src_pad: &gst::Pad,
     frames_tx: &mpsc::Sender<VideoFrame>,
+    marks: &Marks,
 ) -> Result<()> {
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
     let parse = gst::ElementFactory::make("h264parse").build()?;
@@ -456,11 +581,13 @@ fn build_decode_branch(
 
     {
         let frames_tx = frames_tx.clone();
+        let marks = marks.clone();
         let dropped = std::sync::atomic::AtomicU64::new(0);
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    mark(&marks, |p| &mut p.first_frame);
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
                     let info =

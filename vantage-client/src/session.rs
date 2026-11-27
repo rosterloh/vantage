@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use vantage_protocol::ControlMsg;
 use vantage_protocol::codec;
 use vantage_protocol::signalling::{
-    ClientMsg, DialReport, DialStage, IceServer, ServerMsg, Signal, default_ice,
+    ClientMsg, DialReport, DialStage, DialTimings, IceServer, ServerMsg, Signal, default_ice,
 };
 use vantage_protocol::telemetry::DeviceInfo;
 use vantage_signalling::peer::{Peer, PeerEvent, VideoFrame};
@@ -32,6 +32,13 @@ pub trait UiSink: Send + Sync + 'static {
 
 /// A dial that has not reached an open data channel by now is abandoned.
 const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a dial waits for video after the data channel opens before reporting
+/// without a time to first frame.
+const FIRST_FRAME_GRACE: Duration = Duration::from_secs(5);
+
+/// How often in-stream RTP stats are sampled into metrics.
+const STATS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A negotiated connection, ready for the session loop.
 struct Link {
@@ -96,6 +103,7 @@ async fn via_coordinator(coord: &str, token: Option<&str>, ui: &dyn UiSink) -> R
     let ws = CoordinatorWs::connect_with_token(&format!("{coord}/ws/client"), token).await?;
     let (mut tx, mut rx) = ws.split();
     let mut stage = DialStage::SignallingConnected;
+    let mut timings = DialTimings::default();
     let result = async {
         tx.send(&ClientMsg::ListRobots).await?;
         let robots = loop {
@@ -117,12 +125,22 @@ async fn via_coordinator(coord: &str, token: Option<&str>, ui: &dyn UiSink) -> R
         stage = DialStage::RobotSelected;
         let ice = fetch_ice(coord, token).await?;
         let peer = Arc::new(Peer::new(&ice)?);
-        negotiate(&peer, &mut tx, &mut rx, &mut stage, ui).await?;
+        negotiate(
+            &peer,
+            &mut tx,
+            &mut rx,
+            &mut stage,
+            &mut timings,
+            started,
+            ui,
+        )
+        .await?;
+        peer.wait_first_frame(FIRST_FRAME_GRACE).await;
         Ok(peer)
     }
     .await;
 
-    let report = dial_report("coordinator", stage, started, &result).await;
+    let report = dial_report("coordinator", stage, started, timings, &result).await;
     if let Err(e) = tx.send(&ClientMsg::DialReport(report)).await {
         tracing::debug!("dial report not sent: {e}");
     }
@@ -151,15 +169,26 @@ async fn via_mdns(ui: &dyn UiSink) -> Result<Link> {
     let ws = CoordinatorWs::connect(&format!("ws://{}", target.addr)).await?;
     let (mut tx, mut rx) = ws.split();
     let mut stage = DialStage::RobotSelected;
+    let mut timings = DialTimings::default();
     let result = async {
         // No coordinator to fetch ICE from; host candidates carry the LAN.
         let peer = Arc::new(Peer::new(&default_ice())?);
-        negotiate(&peer, &mut tx, &mut rx, &mut stage, ui).await?;
+        negotiate(
+            &peer,
+            &mut tx,
+            &mut rx,
+            &mut stage,
+            &mut timings,
+            started,
+            ui,
+        )
+        .await?;
+        peer.wait_first_frame(FIRST_FRAME_GRACE).await;
         Ok(peer)
     }
     .await;
     // No coordinator on this path: the report only reaches the client's own OTLP.
-    dial_report("lan", stage, started, &result).await;
+    dial_report("lan", stage, started, timings, &result).await;
     Ok(Link {
         peer: result?,
         tx,
@@ -173,24 +202,51 @@ async fn dial_report(
     path: &'static str,
     stage: DialStage,
     started: Instant,
+    mut timings: DialTimings,
     result: &Result<Arc<Peer>>,
 ) -> DialReport {
     use vantage_observability::opentelemetry::{
         KeyValue, global,
         metrics::{Counter, Histogram},
     };
-    static DIALS: std::sync::LazyLock<(Counter<u64>, Histogram<u64>)> =
-        std::sync::LazyLock::new(|| {
-            let m = global::meter("vantage-client");
-            (
-                m.u64_counter("vantage.client.dial_reports").build(),
-                m.u64_histogram("vantage.client.dial_duration")
-                    .with_unit("ms")
-                    .build(),
-            )
-        });
+    struct Instruments {
+        dials: Counter<u64>,
+        duration: Histogram<u64>,
+        stage_duration: Histogram<u64>,
+        ttff: Histogram<u64>,
+    }
+    static DIALS: std::sync::LazyLock<Instruments> = std::sync::LazyLock::new(|| {
+        let m = global::meter("vantage-client");
+        Instruments {
+            dials: m.u64_counter("vantage.client.dial_reports").build(),
+            duration: m
+                .u64_histogram("vantage.client.dial_duration")
+                .with_unit("ms")
+                .build(),
+            stage_duration: m
+                .u64_histogram("vantage.client.dial_stage_duration")
+                .with_unit("ms")
+                .with_description("Time from the previous dial checkpoint to this one")
+                .build(),
+            ttff: m
+                .u64_histogram("vantage.client.time_to_first_frame")
+                .with_unit("ms")
+                .build(),
+        }
+    });
+    // shortcut: a failed dial drops its peer, so its ICE/DTLS marks are lost; keep
+    // the peer on error if failed-dial breakdowns are needed.
     let (local_candidate, remote_candidate) = match result {
-        Ok(peer) => peer.selected_candidate_types().await.unzip(),
+        Ok(peer) => {
+            let since = |t: Option<Instant>| {
+                t.map(|t| t.saturating_duration_since(started).as_millis() as u64)
+            };
+            let m = peer.marks();
+            timings.ice_ms = since(m.ice_connected);
+            timings.dtls_ms = since(m.dtls_connected);
+            timings.first_frame_ms = since(m.first_frame);
+            peer.selected_candidate_types().await.unzip()
+        }
         Err(_) => (None, None),
     };
     let report = DialReport {
@@ -199,6 +255,7 @@ async fn dial_report(
         local_candidate,
         remote_candidate,
         error: result.as_ref().err().map(|e| format!("{e:#}")),
+        timings,
     };
     let unknown = || "unknown".to_string();
     let attrs = [
@@ -213,8 +270,17 @@ async fn dial_report(
             report.remote_candidate.clone().unwrap_or_else(unknown),
         ),
     ];
-    DIALS.0.add(1, &attrs);
-    DIALS.1.record(report.duration_ms, &attrs);
+    DIALS.dials.add(1, &attrs);
+    DIALS.duration.record(report.duration_ms, &attrs);
+    for (stage, ms) in report.timings.segments() {
+        DIALS.stage_duration.record(
+            ms,
+            &[KeyValue::new("path", path), KeyValue::new("stage", stage)],
+        );
+    }
+    if let Some(ms) = report.timings.first_frame_ms {
+        DIALS.ttff.record(ms, &[KeyValue::new("path", path)]);
+    }
     report
 }
 
@@ -224,8 +290,11 @@ async fn negotiate(
     tx: &mut CoordinatorWsTx,
     rx: &mut CoordinatorWsRx,
     stage: &mut DialStage,
+    timings: &mut DialTimings,
+    started: Instant,
     ui: &dyn UiSink,
 ) -> Result<()> {
+    let ms = || Some(started.elapsed().as_millis() as u64);
     tokio::time::timeout(NEGOTIATE_TIMEOUT, async {
         loop {
             tokio::select! {
@@ -233,6 +302,7 @@ async fn negotiate(
                     Some(ServerMsg::Signal { signal, .. }) => {
                         if matches!(signal, Signal::Offer { .. }) {
                             *stage = (*stage).max(DialStage::OfferReceived);
+                            timings.offer_ms = timings.offer_ms.or_else(ms);
                         }
                         if let Err(e) = peer.handle_signal(signal) {
                             tracing::warn!("failed to apply signal: {e}");
@@ -249,12 +319,14 @@ async fn negotiate(
                     Some(PeerEvent::LocalDescription(sig)) => {
                         tx.send(&ClientMsg::Signal { signal: sig }).await?;
                         *stage = (*stage).max(DialStage::AnswerSent);
+                        timings.answer_ms = timings.answer_ms.or_else(ms);
                     }
                     Some(PeerEvent::LocalIce(sig)) => {
                         tx.send(&ClientMsg::Signal { signal: sig }).await?;
                     }
                     Some(PeerEvent::DataChannelOpen) => {
                         *stage = DialStage::Ready;
+                        timings.ready_ms = ms();
                         return Ok(());
                     }
                     Some(_) => {}
@@ -295,6 +367,8 @@ async fn run_answer_loop(
             }
         })
     };
+
+    let stats = tokio::spawn(sample_stream(peer.clone()));
 
     let mut control_closed = false;
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
@@ -363,8 +437,48 @@ async fn run_answer_loop(
         }
     }
     pump.abort();
+    stats.abort();
     peer.shutdown();
     Ok(())
+}
+
+/// Sample inbound video RTP stats into metrics every `STATS_INTERVAL`. Runs as its
+/// own task so a slow `get-stats` never delays operator control.
+async fn sample_stream(peer: Arc<Peer>) {
+    let meter = vantage_observability::opentelemetry::global::meter("vantage-client");
+    let bitrate = meter
+        .f64_gauge("vantage.client.video_bitrate")
+        .with_unit("kbit/s")
+        .build();
+    let lost = meter
+        .u64_counter("vantage.client.video_packets_lost")
+        .build();
+    let jitter = meter
+        .f64_gauge("vantage.client.video_jitter")
+        .with_unit("ms")
+        .build();
+    let mut tick = tokio::time::interval(STATS_INTERVAL);
+    let mut prev: Option<(Instant, vantage_signalling::peer::RtpStats)> = None;
+    loop {
+        tick.tick().await;
+        let Some(now) = peer.rtp_stats().await else {
+            continue;
+        };
+        let at = Instant::now();
+        if let Some((t, p)) = prev {
+            let secs = at.duration_since(t).as_secs_f64();
+            let bits = now.bytes.saturating_sub(p.bytes) as f64 * 8.0;
+            bitrate.record(bits / secs / 1000.0, &[]);
+            lost.add(
+                now.packets_lost.saturating_sub(p.packets_lost).max(0) as u64,
+                &[],
+            );
+        }
+        if let Some(j) = now.jitter_s {
+            jitter.record(j * 1000.0, &[]);
+        }
+        prev = Some((at, now));
+    }
 }
 
 pub(crate) async fn fetch_ice(coord: &str, token: Option<&str>) -> Result<Vec<IceServer>> {

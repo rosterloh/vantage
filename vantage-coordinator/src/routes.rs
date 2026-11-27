@@ -297,16 +297,31 @@ fn record_dial(session: &SessionId, r: &DialReport) {
         KeyValue, global,
         metrics::{Counter, Histogram},
     };
-    static DIALS: std::sync::LazyLock<(Counter<u64>, Histogram<u64>)> =
-        std::sync::LazyLock::new(|| {
-            let m = global::meter("vantage-coordinator");
-            (
-                m.u64_counter("vantage.coordinator.dial_reports").build(),
-                m.u64_histogram("vantage.coordinator.dial_duration")
-                    .with_unit("ms")
-                    .build(),
-            )
-        });
+    struct Instruments {
+        dials: Counter<u64>,
+        duration: Histogram<u64>,
+        stage_duration: Histogram<u64>,
+        ttff: Histogram<u64>,
+    }
+    static DIALS: std::sync::LazyLock<Instruments> = std::sync::LazyLock::new(|| {
+        let m = global::meter("vantage-coordinator");
+        Instruments {
+            dials: m.u64_counter("vantage.coordinator.dial_reports").build(),
+            duration: m
+                .u64_histogram("vantage.coordinator.dial_duration")
+                .with_unit("ms")
+                .build(),
+            stage_duration: m
+                .u64_histogram("vantage.coordinator.dial_stage_duration")
+                .with_unit("ms")
+                .with_description("Time from the previous dial checkpoint to this one")
+                .build(),
+            ttff: m
+                .u64_histogram("vantage.coordinator.time_to_first_frame")
+                .with_unit("ms")
+                .build(),
+        }
+    });
     let none = || "unknown".to_string();
     let local = r.local_candidate.clone().unwrap_or_else(none);
     let remote = r.remote_candidate.clone().unwrap_or_else(none);
@@ -317,6 +332,7 @@ fn record_dial(session: &SessionId, r: &DialReport) {
         local_candidate = %local,
         remote_candidate = %remote,
         error = r.error.as_deref().unwrap_or(""),
+        timings = ?r.timings,
         "dial report"
     );
     let attrs = [
@@ -324,8 +340,16 @@ fn record_dial(session: &SessionId, r: &DialReport) {
         KeyValue::new("local_candidate", local),
         KeyValue::new("remote_candidate", remote),
     ];
-    DIALS.0.add(1, &attrs);
-    DIALS.1.record(r.duration_ms, &attrs);
+    DIALS.dials.add(1, &attrs);
+    DIALS.duration.record(r.duration_ms, &attrs);
+    for (stage, ms) in r.timings.segments() {
+        DIALS
+            .stage_duration
+            .record(ms, &[KeyValue::new("stage", stage)]);
+    }
+    if let Some(ms) = r.timings.first_frame_ms {
+        DIALS.ttff.record(ms, &[]);
+    }
 }
 
 async fn relay_to(state: &Arc<AppState>, peer_key: &str, msg: ServerMsg) {

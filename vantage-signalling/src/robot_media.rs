@@ -222,8 +222,10 @@ impl RobotMedia {
         // request-aux-sender REQUIRES a non-None GstElement return; returning None
         // panics in GLib's closure marshaller. So we only connect when the factory
         // is confirmed present. On this host rtpgccbwe is absent → log once, skip.
+        let gcc_bps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         if gst::ElementFactory::find("rtpgccbwe").is_some() {
             let enc_weak = self.enc.downgrade();
+            let gcc_bps = gcc_bps.clone();
             let unit = self
                 .enc
                 .factory()
@@ -246,9 +248,11 @@ impl RobotMedia {
                     }
                 };
                 let enc_weak = enc_weak.clone();
+                let gcc_bps = gcc_bps.clone();
                 gcc.connect("notify::estimated-bitrate", false, move |args| {
                     let gcc_el = args[0].get::<gst::Element>().ok()?;
                     let bps: u32 = gcc_el.property("estimated-bitrate");
+                    gcc_bps.store(bps, std::sync::atomic::Ordering::Relaxed);
                     // Clamp to 300–2500 kbit/s, then scale to the encoder's unit.
                     let kbps = (bps / 1000).clamp(300, 2500);
                     let value = match unit {
@@ -350,6 +354,7 @@ impl RobotMedia {
             data_channel: std::sync::Mutex::new(Some(dc)),
             forwarder,
             tunnels,
+            gcc_bps,
         })
     }
 
@@ -441,6 +446,7 @@ pub struct Consumer {
     data_channel: std::sync::Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
     forwarder: tokio::task::JoinHandle<()>,
     tunnels: Tunnels,
+    gcc_bps: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Options for the `control` data channel: unreliable + unordered so a lost or late
@@ -560,6 +566,21 @@ impl Consumer {
             }
         }
         Ok(())
+    }
+
+    /// Sample this consumer's RTP stats (bytes sent, RTCP-reported RTT and loss).
+    /// `f` runs later on a GStreamer thread, so the caller never waits.
+    pub fn sample_rtp_stats(&self, f: impl FnOnce(crate::peer::RtpStats) + Send + 'static) {
+        crate::peer::request_stats(&self.webrtcbin, move |s| {
+            if let Some(s) = s {
+                f(crate::peer::rtp_stats(s));
+            }
+        });
+    }
+
+    /// Latest GCC bandwidth estimate in bit/s; `None` without `rtpgccbwe`.
+    pub fn estimated_bitrate(&self) -> Option<u32> {
+        Some(self.gcc_bps.load(std::sync::atomic::Ordering::Relaxed)).filter(|&b| b > 0)
     }
 
     /// Send bytes on the telemetry data channel.

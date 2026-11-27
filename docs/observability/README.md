@@ -43,3 +43,40 @@ already use the normalized names, e.g.:
 If your stack is configured to append OTLP **unit** suffixes as well, names may
 differ (e.g. `..._percent`, `..._mb`); adjust the panel queries or disable that
 option on the OTLP endpoint.
+
+## Connection and stream metrics
+
+Each client dial reports when it reached each checkpoint, in ms from dial start:
+the robot's offer, the client's answer, ICE connected, DTLS connected, data
+channel open (`ready`) and the first decoded video frame. The client sends these
+to the coordinator in its `DialReport` (`timings`), and both sides record:
+
+| Instrument | Attributes | Meaning |
+|------------|------------|---------|
+| `vantage.{client,coordinator}.dial_stage_duration` (histogram, ms) | `stage` (+ `path` on the client) | Time from the previous checkpoint to this one |
+| `vantage.{client,coordinator}.time_to_first_frame` (histogram, ms) | `path` on the client | Dial start to first decoded frame |
+
+A slow `offer` stage points at the coordinator or robot; slow `ice`/`dtls` at the
+network path. The coordinator only sees dials that went through it, while the
+client's own metrics also include LAN (`path=lan`) dials. A dial waits up to 5 s
+for the first frame before it reports.
+
+While streaming, the client samples webrtcbin stats every 2 s and the robot
+samples each viewer every second:
+
+| Instrument | Meaning |
+|------------|---------|
+| `vantage.client.video_bitrate` (gauge, kbit/s) | Received video bitrate |
+| `vantage.client.video_packets_lost` (counter) | Lost video RTP packets |
+| `vantage.client.video_jitter` (gauge, ms) | Inbound RTP jitter |
+| `vantage.robot.stream_rtt` (histogram, ms, `path`) | RTT from RTCP receiver reports |
+| `vantage.robot.stream_estimated_bitrate` (histogram, kbit/s, `path`) | GCC bandwidth estimate (only with `rtpgccbwe`) |
+
+To check that signalling delay shows up where expected, add delay to the
+coordinator's port and dial again:
+
+```bash
+mise run netem -- on 250   # +250 ms each way on TCP 8080 via lo (sudo)
+mise run client            # offer stage grows ~250 ms per signalling hop
+mise run netem -- off
+```

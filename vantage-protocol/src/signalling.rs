@@ -101,6 +101,55 @@ pub struct DialReport {
     /// Why the dial stopped short of `Ready`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When each checkpoint was reached. Absent from older clients.
+    #[serde(default)]
+    pub timings: DialTimings,
+}
+
+/// Milliseconds from dial start to each checkpoint, where it was reached.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DialTimings {
+    /// Robot's offer arrived (covers robot selection and the robot creating it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_ms: Option<u64>,
+    /// ICE connectivity established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_ms: Option<u64>,
+    /// DTLS handshake done (peer connection `connected`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtls_ms: Option<u64>,
+    /// Data channel open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_ms: Option<u64>,
+    /// First decoded video frame (time to first frame).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_frame_ms: Option<u64>,
+}
+
+impl DialTimings {
+    /// `(checkpoint, ms since the previous reached checkpoint)` in time order.
+    /// Video and the data channel both start after DTLS, so either may come first.
+    pub fn segments(&self) -> Vec<(&'static str, u64)> {
+        let mut marks: Vec<(&'static str, u64)> = [
+            ("offer", self.offer_ms),
+            ("answer", self.answer_ms),
+            ("ice", self.ice_ms),
+            ("dtls", self.dtls_ms),
+            ("ready", self.ready_ms),
+            ("first_frame", self.first_frame_ms),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v?)))
+        .collect();
+        marks.sort_by_key(|&(_, ms)| ms);
+        let mut prev = 0;
+        for (_, ms) in &mut marks {
+            (*ms, prev) = (*ms - prev, *ms);
+        }
+        marks
+    }
 }
 
 /// coordinator -> robot or client
@@ -185,6 +234,11 @@ mod tests {
             local_candidate: Some("host".into()),
             remote_candidate: Some("relay".into()),
             error: None,
+            timings: DialTimings {
+                offer_ms: Some(300),
+                ready_ms: Some(812),
+                ..Default::default()
+            },
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(msg, serde_json::from_str::<ClientMsg>(&json).unwrap());
@@ -193,6 +247,38 @@ mod tests {
             "absent error must be omitted: {json}"
         );
         assert!(DialStage::OfferReceived < DialStage::Ready);
+        // Reports from clients without timings still decode.
+        let old = r#"{"type":"dial_report","stage":"ready","duration_ms":5}"#;
+        assert!(serde_json::from_str::<ClientMsg>(old).is_ok());
+    }
+
+    #[test]
+    fn dial_segments_are_deltas_in_time_order() {
+        let t = DialTimings {
+            offer_ms: Some(100),
+            answer_ms: Some(120),
+            ice_ms: Some(300),
+            dtls_ms: Some(350),
+            ready_ms: Some(400),
+            first_frame_ms: Some(380),
+        };
+        assert_eq!(
+            t.segments(),
+            [
+                ("offer", 100),
+                ("answer", 20),
+                ("ice", 180),
+                ("dtls", 50),
+                ("first_frame", 30),
+                ("ready", 20),
+            ]
+        );
+        let partial = DialTimings {
+            offer_ms: Some(100),
+            ice_ms: Some(250),
+            ..Default::default()
+        };
+        assert_eq!(partial.segments(), [("offer", 100), ("ice", 150)]);
     }
 
     #[test]
