@@ -25,7 +25,7 @@ jobs:
       # rtph264pay (good), webrtcbin (bad), x264enc (ugly), avdec_h264 (libav),
       # and libnice for webrtcbin ICE.
       # libfontconfig1-dev is required by slint (via yeslogic-fontconfig-sys) in vantage-client.
-      # The `ros` feature (r2r) needs a full ROS 2 install and is left off here.
+      # The `ros` feature (rclrs) needs a sourced ROS 2 install and is left off here.
       - name: Install system libraries
         run: |
           sudo apt-get update

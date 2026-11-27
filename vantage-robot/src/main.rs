@@ -80,39 +80,17 @@ async fn main() -> Result<()> {
     let (events_tx, mut events_rx) =
         tokio::sync::mpsc::unbounded_channel::<(SessionId, PeerEvent)>();
 
-    // Construct the ROS bridge once and share it across client sessions. The
-    // bridge spins its own executor on a dedicated thread (see CameraBridge::new).
+    // ROS bridge, on its own spin thread: subscribes when the video source is ROS,
+    // else drains the raw (pre-encode) branch into ~/image_raw. recv_raw_frame locks
+    // one receiver, so exactly one drain owns it.
     #[cfg(feature = "ros")]
-    let ros_bridge = Arc::new(ros::CameraBridge::new()?);
-
-    // Drain the raw (pre-encode) branch once, for the engine's lifetime, concurrently
-    // with the WebRTC streams. recv_raw_frame locks one receiver, so exactly one drain
-    // owns it — the active branch is selected at compile time by the `ros` feature.
-    #[cfg(feature = "ros")]
-    {
-        let media_raw = media.clone();
-        let bridge = ros_bridge.clone();
-        let metrics = metrics.clone();
-        tokio::spawn(async move {
-            let mut n: u64 = 0;
-            while let Some(frame) = media_raw.recv_raw_frame().await {
-                n += 1;
-                metrics.frame_published();
-                let (w, h) = (frame.width, frame.height);
-                match bridge.publish(frame) {
-                    Ok(()) => {
-                        if n == 1 || n.is_multiple_of(30) {
-                            tracing::info!("published ros image {w}x{h} (#{n})");
-                        }
-                    }
-                    Err(e) => tracing::warn!("ros publish failed: {e}"),
-                }
-            }
-            tracing::warn!("raw-frame drain task exited");
-        });
-    }
+    let _ros = ros::start(&media, &metrics)?;
     #[cfg(not(feature = "ros"))]
     {
+        anyhow::ensure!(
+            media.frame_input().is_none(),
+            "VANTAGE_VIDEO_SOURCE=ros needs vantage-robot built with --features ros"
+        );
         let media_raw = media.clone();
         let metrics = metrics.clone();
         tokio::spawn(async move {

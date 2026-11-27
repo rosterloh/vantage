@@ -4,6 +4,7 @@
 //! default (ROS-free) lane.
 
 use vantage_signalling::peer::RawFrame;
+use vantage_signalling::robot_media::PixelFormat;
 
 /// Plain description of a `sensor_msgs/Image` body.
 pub struct ImageParts {
@@ -46,9 +47,33 @@ pub fn camera_info_parts(frame: &RawFrame) -> CameraInfoParts {
     }
 }
 
+/// The pipeline layout for a `sensor_msgs/Image` encoding, or `None` for one it
+/// can't take (16-bit, Bayer, float).
+pub fn pixel_format(encoding: &str) -> Option<PixelFormat> {
+    Some(match encoding {
+        "rgb8" => PixelFormat::Rgb,
+        "bgr8" => PixelFormat::Bgr,
+        "rgba8" => PixelFormat::Rgba,
+        "bgra8" => PixelFormat::Bgra,
+        "mono8" => PixelFormat::Gray8,
+        // image_encodings.hpp: "yuv422" is UYVY, "yuv422_yuy2" is YUYV.
+        "uyvy" | "yuv422" => PixelFormat::Uyvy,
+        "yuyv" | "yuv422_yuy2" => PixelFormat::Yuy2,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pixel_format_maps_ros_encodings() {
+        assert_eq!(pixel_format("rgb8"), Some(PixelFormat::Rgb));
+        assert_eq!(pixel_format("yuv422"), Some(PixelFormat::Uyvy));
+        assert_eq!(pixel_format("yuv422_yuy2"), Some(PixelFormat::Yuy2));
+        assert_eq!(pixel_format("16UC1"), None, "depth is not video");
+    }
     use vantage_signalling::peer::RawFrame;
 
     fn frame(w: u32, h: u32) -> RawFrame {
